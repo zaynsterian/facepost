@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ro">
+  <head>
+    <meta charset="utf-8">
+    <title>{{ title or "Facepost License Server" }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/static/admin.css">
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="top">
+        <h1>Facepost License Server</h1>
+        {% if session.get('admin_ok') %}
+          <form method="post" action="/admin/logout"><button class="btn ghost">Logout</button></form>
+        {% endif %}
+      </header>
+      {% block content %}{% endblock %}
+    </div>
+    <div id="toast" class="toast" hidden></div>
+    <script>
+      function toast(msg, ok=true){
+        const t=document.getElementById('toast');
+        t.textContent=msg; t.className='toast ' + (ok?'ok':'err'); t.hidden=false;
+        setTimeout(()=>t.hidden=true, 2500);
+      }
+      async function postJson(url, body){
+        const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        const j = await r.json().catch(()=>({error:'invalid json'}));
+        if(!r.ok){ toast(j.error||('HTTP '+r.status), false); throw new Error('HTTP '+r.status); }
+        return j;
+      }
+    </script>
+  </body>
+</html>

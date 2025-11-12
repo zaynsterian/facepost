@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}{{ title or "Facepost License Server" }}{% endblock %}
+
+{% block content %}
+<header class="topbar">
+  <h1>{{ title or "Facepost License Server" }}</h1>
+  <form action="/admin/logout" method="post">
+    <button class="btn">LOGOUT</button>
+  </form>
+</header>
+
+<section class="card">
+  <h2>Gestionează licențe</h2>
+  <div class="grid" style="grid-template-columns: 2fr 120px 150px 2fr 140px;">
+    <input id="email" placeholder="Email" />
+    <input id="days" type="number" min="1" value="30" placeholder="Zile" />
+    <input id="max_devices" type="number" min="1" value="1" placeholder="Max devices" />
+    <input id="notes" placeholder="Notițe (nume pensiune / unitate)" />
+    <button id="btnIssue" class="btn primary">CREEAZĂ/PRElUNGEȘTE</button>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Licențe existente</h2>
+  <div class="tablewrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Notițe</th>
+          <th>Status</th>
+          <th>Expiră</th>
+          <th>Licență</th>
+          <th style="width:220px">Acțiuni</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        {% for r in rows %}
+        <tr data-email="{{ r.email }}">
+          <td class="mono">{{ r.email }}</td>
+          <td>
+            <div class="notes-cell">
+              <input class="notes-input" value="{{ r.notes or '' }}" placeholder="Notițe…" />
+              <button class="btn" data-save-notes>SAVE</button>
+            </div>
+          </td>
+          <td>
+            {% if r.status == 'ok' %}
+              <span class="pill ok">ok</span>
+            {% elif r.status == 'suspended' %}
+              <span class="pill bad">suspended</span>
+            {% else %}
+              <span class="pill">{{ r.status }}</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ r.expires_at }}</td>
+          <td class="mono small">{{ r.license_id }}</td>
+          <td>
+            <div class="actions">
+              <button class="btn" data-renew>RENEW +30</button>
+              {% if r.status == 'ok' %}
+                <button class="btn bad" data-suspend>SUSPEND</button>
+              {% else %}
+                <button class="btn" data-renew>REACTIVATE +30</button>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- toaster simplu -->
+<div id="toaster" class="toast" hidden></div>
+
+<script>
+  const $ = (q, el=document) => el.querySelector(q);
+  const $$ = (q, el=document) => [...el.querySelectorAll(q)];
+
+  async function postJson(url, body){
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body||{})
+    });
+    let data = null;
+    try { data = await res.json(); } catch(e){}
+    return { ok: res.ok, status: res.status, data };
+  }
+
+  function toast(msg, ms=1600){
+    const t = $('#toaster');
+    t.textContent = msg;
+    t.hidden = false;
+    t.classList.add('show');
+    setTimeout(()=>{ t.classList.remove('show'); t.hidden = true; }, ms);
+  }
+
+  // Create / Renew (din formularul de sus)
+  $('#btnIssue').addEventListener('click', async ()=>{
+    const email = $('#email').value.trim();
+    const days = parseInt($('#days').value || '30', 10);
+    const max_devices = parseInt($('#max_devices').value || '1', 10);
+    const notes = $('#notes').value.trim();
+
+    if(!email){ toast('Email lipsă'); return; }
+
+    const {ok, data} = await postJson('/admin/api/issue', { email, days, max_devices, notes });
+    if(ok){ toast('Licență creată/prelungită'); location.reload(); }
+    else { toast(data?.error || 'Eroare'); }
+  });
+
+  // Acțiuni pe rânduri: renew, suspend, save notes
+  $('#rows').addEventListener('click', async (ev)=>{
+    const tr = ev.target.closest('tr[data-email]');
+    if(!tr) return;
+    const email = tr.dataset.email;
+
+    // RENEW
+    if(ev.target.matches('[data-renew]')){
+      const {ok, data} = await postJson('/admin/api/issue', { email, days: 30 });
+      if(ok){ toast('Prelungit +30 zile'); location.reload(); }
+      else { toast(data?.error || 'Eroare'); }
+      return;
+    }
+
+    // SUSPEND
+    if(ev.target.matches('[data-suspend]')){
+      if(!confirm(`Suspend licența pentru ${email}?`)) return;
+      const {ok, data} = await postJson('/admin/api/suspend', { email });
+      if(ok){ toast('Suspendat'); location.reload(); }
+      else { toast(data?.error || 'Eroare'); }
+      return;
+    }
+
+    // SAVE NOTES
+    if(ev.target.matches('[data-save-notes]')){
+      const input = $('.notes-input', tr);
+      const notes = input ? input.value.trim() : '';
+      const {ok, data} = await postJson('/admin/api/notes', { email, notes });
+      if(ok){ toast('Notițe salvate'); }
+      else { toast(data?.error || 'Eroare'); }
+      return;
+    }
+  });
+</script>
+{% endblock %}
