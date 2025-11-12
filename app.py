@@ -1,217 +1,182 @@
 import os
-import uuid
 from datetime import datetime, timedelta, timezone
+from flask import Flask, request, jsonify, abort, session, redirect, url_for, render_template_string
 
-from flask import (
-    Flask, request, jsonify, abort,
-    session, redirect, url_for, render_template_string
-)
+# ------------------ Config ------------------
+APP_NAME        = os.getenv("APP_NAME", "Facepost License Server")
+ADMIN_API_KEY   = os.getenv("ADMIN_API_KEY", "CHANGE_ME_ADMIN_KEY")
+ADMIN_PASS      = os.getenv("ADMIN_PASS", "CHANGE_ME_ADMIN_PASS")
+SECRET_KEY      = os.getenv("FLASK_SECRET", os.urandom(24).hex())
 
-# ----------------- Config -----------------
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET", "dev-secret-change-me")
+app.secret_key = SECRET_KEY
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "CHANGE_ME")        # pentru /issue, /suspend
-ADMIN_UI_PASSWORD = os.getenv("ADMIN_UI_PASSWORD", "admin123") # login la /admin
-APP_NAME = "Facepost Admin"
+# ------------------ In-memory storage ------------------
+# Structura:
+# LICENSES = {
+#   "email@domeniu": {
+#       "status": "ok" | "suspended",
+#       "expires_at": "ISO-8601",
+#       "license_id": "<uuid-like>",
+#       "max_devices": 1,
+#       "devices": {"FP1","FP2"}
+#   },
+# }
+LICENSES: dict[str, dict] = {}
 
-# ----------------- In-memory storage (MVP) -----------------
-# email -> dict(status, expires_at, license_id, max_devices, devices:set, updated_at)
-LICENSES = {}
 
+# ------------------ Utils ------------------
 def now_utc():
     return datetime.now(timezone.utc)
 
 def iso(dt: datetime) -> str:
-    # ISO 8601, cu offset (ex: +00:00)
-    return dt.isoformat(timespec="seconds")
+    return dt.astimezone(timezone.utc).isoformat()
 
 def parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s)
+    # acceptă ISO cu sau fără offset 'Z'
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 def normalize_email(e: str) -> str:
     return (e or "").strip().lower()
 
-def require_admin_header():
-    hdr = request.headers.get("X-Admin-Key", "")
-    if not hdr or hdr != ADMIN_API_KEY:
+def ensure_admin_header():
+    key = request.headers.get("X-Admin-Key", "")
+    if not key or key != ADMIN_API_KEY:
         abort(401)
 
-def upsert_license(email: str, data: dict):
-    rec = LICENSES.get(email, {
-        "status": "ok",
-        "expires_at": iso(now_utc()),
-        "license_id": str(uuid.uuid4()),
-        "max_devices": 1,
-        "devices": set()
-    })
-    # merge
-    for k, v in data.items():
-        if k == "devices" and isinstance(v, (set, list)):
-            rec["devices"] = set(v)
-        else:
-            rec[k] = v
-    rec["updated_at"] = iso(now_utc())
-    LICENSES[email] = rec
-    return rec
+def admin_logged_in() -> bool:
+    return session.get("admin_ok") is True
 
-def extend_days(current_exp_iso: str, days: int) -> str:
-    base = parse_iso(current_exp_iso)
-    if base < now_utc():
-        base = now_utc()
-    return iso(base + timedelta(days=days))
 
-# ----------------- Health -----------------
-@app.get("/")
-def root():
-    return "OK", 200
+# ------------------ Core license ops ------------------
+def issue_or_renew(email: str, days: int = 30, max_devices: int = 1) -> dict:
+    email = normalize_email(email)
+    if not email:
+        raise ValueError("invalid email")
 
-# ----------------- License: ISSUE/RENEW -----------------
-@app.post("/issue")
-def issue():
-    require_admin_header()
-    payload = request.get_json(silent=True) or {}
-    email = normalize_email(payload.get("email"))
-    days = int(payload.get("days", 30))
-    max_devices = int(payload.get("max_devices", 1))
-
-    if not email or days <= 0:
-        return jsonify({"status": "error", "error": "invalid_input"}), 400
-
-    # dacă există deja licență -> extinde; altfel creează
-    existing = LICENSES.get(email)
-    if existing:
-        new_exp = extend_days(existing["expires_at"], days)
-        rec = upsert_license(email, {
-            "expires_at": new_exp,
+    rec = LICENSES.get(email)
+    if rec is None:
+        # create new
+        expires = now_utc() + timedelta(days=days)
+        rec = {
             "status": "ok",
-            "max_devices": max_devices or existing.get("max_devices", 1)
-        })
-    else:
-        rec = upsert_license(email, {
-            "license_id": str(uuid.uuid4()),
-            "expires_at": iso(now_utc() + timedelta(days=days)),
-            "status": "ok",
-            "max_devices": max_devices,
+            "expires_at": iso(expires),
+            "license_id": os.urandom(16).hex(),
+            "max_devices": max(1, int(max_devices or 1)),
             "devices": set()
-        })
+        }
+        LICENSES[email] = rec
+    else:
+        # renew/extend
+        cur_exp = parse_iso(rec["expires_at"])
+        base = cur_exp if cur_exp > now_utc() else now_utc()
+        rec["expires_at"] = iso(base + timedelta(days=days))
+        if max_devices:
+            rec["max_devices"] = max(1, int(max_devices))
+        rec.setdefault("devices", set())
 
-    return jsonify({
-        "status": "ok",
+    # serializare pentru răspuns
+    return {
         "email": email,
+        "status": rec["status"],
         "expires_at": rec["expires_at"],
         "license_id": rec["license_id"]
-    })
+    }
 
-# ----------------- License: SUSPEND -----------------
-@app.post("/suspend")
-def suspend():
-    require_admin_header()
-    payload = request.get_json(silent=True) or {}
-    email = normalize_email(payload.get("email"))
-    if not email:
-        return jsonify({"status": "error", "error": "invalid_input"}), 400
-
+def suspend(email: str) -> dict:
+    email = normalize_email(email)
     rec = LICENSES.get(email)
-    if not rec:
-        return jsonify({"status": "ok", "email": email})  # idempotent
-    rec = upsert_license(email, {"status": "inactive"})
-    return jsonify({"status": "ok", "email": email})
+    if rec is None:
+        return {"email": email, "status": "not_found"}
+    rec["status"] = "suspended"
+    return {"email": email, "status": "ok"}
 
-# ----------------- Device: BIND -----------------
-@app.post("/bind")
-def bind():
-    payload = request.get_json(silent=True) or {}
-    email = normalize_email(payload.get("email"))
-    fingerprint = (payload.get("fingerprint") or "").strip()
-
-    if not email or not fingerprint:
-        return jsonify({"status": "error", "error": "invalid_input"}), 400
-
+def bind_device(email: str, fingerprint: str) -> dict:
+    email = normalize_email(email)
+    fp = (fingerprint or "").strip()
     rec = LICENSES.get(email)
-    if not rec:
-        return jsonify({"status": "denied", "error": "no_license"}), 403
+    if rec is None:
+        return {"status": "not_found"}
 
-    # status & expirare
     if rec.get("status") != "ok":
-        return jsonify({"status": "denied", "error": "inactive"}), 403
-    if parse_iso(rec["expires_at"]) <= now_utc():
-        return jsonify({"status": "denied", "error": "expired"}), 403
+        return {"status": "suspended"}
 
-    devices = rec.get("devices", set())
-    if fingerprint in devices:
-        return jsonify({"status": "ok"})  # deja legat
+    if parse_iso(rec["expires_at"]) < now_utc():
+        return {"status": "expired"}
+
+    devices: set = rec.setdefault("devices", set())
+    if fp in devices:
+        return {"status": "ok"}  # deja asociat
 
     if len(devices) >= int(rec.get("max_devices", 1)):
-        return jsonify({"status": "denied", "error": "device_limit"}), 403
+        return {"status": "max_devices"}
 
-    devices.add(fingerprint)
-    upsert_license(email, {"devices": devices})
-    return jsonify({"status": "ok"})
+    devices.add(fp)
+    return {"status": "ok"}
 
-# ----------------- Device/License: CHECK -----------------
-@app.post("/check")
-def check():
-    payload = request.get_json(silent=True) or {}
-    email = normalize_email(payload.get("email"))
-    fingerprint = (payload.get("fingerprint") or "").strip()
-
-    if not email or not fingerprint:
-        return jsonify({"status": "error", "error": "invalid_input"}), 400
-
+def check_status(email: str, fingerprint: str) -> dict:
+    email = normalize_email(email)
     rec = LICENSES.get(email)
-    if not rec:
-        return jsonify({"status": "denied", "error": "no_license"}), 403
+    if rec is None:
+        return {"status": "not_found"}
 
     if rec.get("status") != "ok":
-        return jsonify({"status": "denied", "error": "inactive"}), 403
+        return {"status": "suspended"}
 
-    if parse_iso(rec["expires_at"]) <= now_utc():
-        return jsonify({"status": "denied", "error": "expired"}), 403
+    if parse_iso(rec["expires_at"]) < now_utc():
+        return {"status": "expired"}
 
-    if fingerprint not in rec.get("devices", set()):
-        return jsonify({"status": "denied", "error": "not_bound"}), 403
+    devices: set = rec.setdefault("devices", set())
+    if fingerprint and fingerprint not in devices:
+        # dacă clientul n-a făcut bind, îl tratăm ca neautorizat
+        return {"status": "unbound"}
 
-    return jsonify({"status": "ok", "expires_at": rec["expires_at"]})
+    return {
+        "status": "ok",
+        "expires_at": rec["expires_at"]
+    }
 
-# =========================================================
-# ================ ADMIN PANEL (in-memory) ================
-# =========================================================
 
-def admin_logged_in() -> bool:
-    return session.get("admin") is True
+# ------------------ JSON API ------------------
+@app.post("/issue")
+def api_issue():
+    ensure_admin_header()
+    data = request.get_json(force=True, silent=True) or {}
+    out = issue_or_renew(
+        email=data.get("email", ""),
+        days=int(data.get("days", 30)),
+        max_devices=int(data.get("max_devices", 1)),
+    )
+    return jsonify(out)
 
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    if request.method == "POST":
-        pwd = request.form.get("password", "")
-        if pwd == ADMIN_UI_PASSWORD:
-            session["admin"] = True
-            return redirect(url_for("admin_home"))
-        return "Wrong password", 401
+@app.post("/suspend")
+def api_suspend():
+    ensure_admin_header()
+    data = request.get_json(force=True, silent=True) or {}
+    out = suspend(data.get("email", ""))
+    return jsonify(out)
 
-    return render_template_string("""
-<!doctype html><title>{{app}}</title>
-<link rel="stylesheet" href="https://unpkg.com/milligram/dist/milligram.min.css">
-<div class="container" style="margin-top:4rem; max-width:560px">
-  <h3>{{app}} – Login</h3>
-  <form method="post">
-    <label>Parola</label>
-    <input type="password" name="password" required>
-    <button class="button">Login</button>
-  </form>
-</div>
-""", app=APP_NAME)
+@app.post("/bind")
+def api_bind():
+    data = request.get_json(force=True, silent=True) or {}
+    out = bind_device(
+        email=data.get("email", ""),
+        fingerprint=data.get("fingerprint", "")
+    )
+    return jsonify(out)
 
-@app.route("/admin/logout")
-def admin_logout():
-    session.clear()
-    return redirect(url_for("admin_login"))
+@app.post("/check")
+def api_check():
+    data = request.get_json(force=True, silent=True) or {}
+    out = check_status(
+        email=data.get("email", ""),
+        fingerprint=data.get("fingerprint", "")
+    )
+    return jsonify(out)
 
-# template inline pt tabel (HTMX)
-@app.context_processor
-def inject_table_template():
-    table_tpl = """
+
+# ------------------ Admin UI (HTMX) ------------------
+TABLE_TEMPLATE = """
 <table>
   <thead>
     <tr>
@@ -240,13 +205,45 @@ def inject_table_template():
   </tbody>
 </table>
 """
-    return {"table.html": table_tpl}
 
-@app.route("/admin")
+@app.get("/admin/login")
+def admin_login():
+    if admin_logged_in():
+        return redirect(url_for("admin_home"))
+    return render_template_string("""
+<!doctype html><title>Login - {{app}}</title>
+<link rel="stylesheet" href="https://unpkg.com/milligram/dist/milligram.min.css">
+<div class="container" style="margin-top:4rem;max-width:520px">
+  <h3>{{app}} — Admin Login</h3>
+  <form method="post" action="{{url_for('admin_login_post')}}">
+    <label>Parolă admin</label>
+    <input type="password" name="pass" required>
+    <button class="button-primary">Login</button>
+  </form>
+</div>
+""", app=APP_NAME)
+
+@app.post("/admin/login")
+def admin_login_post():
+    pwd = request.form.get("pass", "")
+    if pwd and pwd == ADMIN_PASS:
+        session["admin_ok"] = True
+        return redirect(url_for("admin_home"))
+    return "Unauthorized", 401
+
+@app.get("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+@app.get("/admin")
 def admin_home():
     if not admin_logged_in():
         return redirect(url_for("admin_login"))
+
     rows = sorted(LICENSES.items(), key=lambda kv: kv[0])
+    table_html = render_template_string(TABLE_TEMPLATE, rows=rows)
+
     return render_template_string("""
 <!doctype html><title>{{app}}</title>
 <script src="https://unpkg.com/htmx.org@2.0.2"></script>
@@ -267,15 +264,16 @@ def admin_home():
   </form>
 
   <div id="table">
-    {% include 'table.html' %}
+    {{ table_html|safe }}
   </div>
 </div>
-""", app=APP_NAME, rows=rows), 200, {"Content-Type": "text/html; charset=utf-8"}
+""", app=APP_NAME, table_html=table_html), 200, {"Content-Type": "text/html; charset=utf-8"}
 
-# acțiuni admin – apelează intern /issue și /suspend
 @app.post("/admin/issue")
 def admin_issue():
-    if not admin_logged_in(): abort(401)
+    if not admin_logged_in():
+        abort(401)
+
     payload = {
         "email": normalize_email(request.form.get("email", "")),
         "days": int(request.form.get("days", "30")),
@@ -283,25 +281,32 @@ def admin_issue():
     }
     if not payload["email"]:
         return "invalid email", 400
-    # simulează call intern
-    with app.test_request_context():
-        with app.test_client() as c:
-            rv = c.post("/issue", json=payload, headers={"X-Admin-Key": ADMIN_API_KEY})
-            _ = rv.get_json()
+
+    # folosim același cod ca API-ul, fără să mai facem request intern
+    issue_or_renew(payload["email"], payload["days"], payload["max_devices"])
+
     rows = sorted(LICENSES.items(), key=lambda kv: kv[0])
-    return render_template_string("{% include 'table.html' %}", rows=rows)
+    return render_template_string(TABLE_TEMPLATE, rows=rows), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @app.post("/admin/suspend")
 def admin_suspend():
-    if not admin_logged_in(): abort(401)
-    email = normalize_email(request.form.get("email", ""))
-    with app.test_request_context():
-        with app.test_client() as c:
-            rv = c.post("/suspend", json={"email": email}, headers={"X-Admin-Key": ADMIN_API_KEY})
-            _ = rv.get_json()
-    rows = sorted(LICENSES.items(), key=lambda kv: kv[0])
-    return render_template_string("{% include 'table.html' %}", rows=rows)
+    if not admin_logged_in():
+        abort(401)
 
-# ----------------- Run (Render folosește gunicorn/uwsgi, dar local OK) -----------------
+    email = normalize_email(request.form.get("email", ""))
+    suspend(email)
+
+    rows = sorted(LICENSES.items(), key=lambda kv: kv[0])
+    return render_template_string(TABLE_TEMPLATE, rows=rows), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ------------------ health/home ------------------
+@app.get("/")
+def home():
+    return jsonify({"app": APP_NAME, "ok": True})
+
+
+# ------------------ Run ------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
+    # În producție Render pornește procesul; acest block e util local.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
