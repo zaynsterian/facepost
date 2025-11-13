@@ -6,7 +6,7 @@ updates_bp = Blueprint("updates", __name__)
 # >>>>>>> EDITAȚI DOAR ACESTE DOUĂ CONSTANTE CÂND FACEȚI UN RELEASE NOU <<<<<<<
 CURRENT_CLIENT_VERSION = "1.1.0"
 CLIENT_DOWNLOAD_URL = (
-    "https://github.com/<USER_GITHUB>/facepost-client/releases/download/v1.1.0/Facepost.exe"
+    "https://github.com/zaynsterian/facepost-client/releases/tag/v1.1.0"
 )
 # Înlocuiește <USER_GITHUB> cu userul tău GitHub
 
