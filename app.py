@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from flask import Flask, jsonify, request, session, redirect, render_template_string
 from supabase import create_client, Client
+from updates_blueprint import updates_bp
 
 # ------------------ Config ------------------
 APP_NAME = os.environ.get("APP_NAME", "Facepost License Server")
