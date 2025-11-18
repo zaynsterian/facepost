@@ -2,9 +2,16 @@ import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from flask import Flask, jsonify, request, session, redirect, render_template_string
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    session,
+    redirect,
+    render_template_string,
+)
 from supabase import create_client, Client
-from updates_blueprint import updates_bp
+from updates_blueprint import updates_bp  # blueprint-ul pentru /updates etc.
 
 # ------------------ Config ------------------
 APP_NAME = os.environ.get("APP_NAME", "Facepost License Server")
@@ -39,8 +46,10 @@ def _require_admin_api(req: request):
 
 
 def _require_admin():
+    """Folosit în rutele /admin; dacă nu e logat, întoarce un redirect."""
     if not session.get("admin_ok"):
         return redirect("/admin/login")
+    return None
 
 
 def _json_error(msg, code=400):
@@ -48,19 +57,24 @@ def _json_error(msg, code=400):
 
 
 def get_or_create_user(email: str) -> str:
-    """Returnează app_user.id pentru email; îl creează dacă lipsește."""
+    """Returnează app_users.id pentru email; îl creează dacă lipsește."""
     email = (email or "").strip().lower()
     if not email:
         raise ValueError("email required")
 
-    row = (
-        supabase.table("app_users")
-        .select("id")
-        .eq("email", email)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    try:
+        res = (
+            supabase.table("app_users")
+            .select("id")
+            .eq("email", email)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        app.logger.exception("Supabase error la get_or_create_user: %s", e)
+        raise
+
+    row = getattr(res, "data", None)
     if row and row.get("id"):
         return row["id"]
 
@@ -71,28 +85,43 @@ def get_or_create_user(email: str) -> str:
 
 def load_license_for_email(email: str):
     """Întoarce licența dacă există pentru email (una per client)."""
-    # Licența e în licenses, email-ul în app_users -> join în 2 pași
-    user = (
-        supabase.table("app_users")
-        .select("id")
-        .eq("email", email.strip().lower())
-        .maybe_single()
-        .execute()
-        .data
-    )
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+
+    # 1) user
+    try:
+        res_user = (
+            supabase.table("app_users")
+            .select("id")
+            .eq("email", email)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        app.logger.exception("Supabase error la load_license_for_email (user): %s", e)
+        return None
+
+    user = getattr(res_user, "data", None)
     if not user:
         return None
 
-    lic = (
-        supabase.table("licenses")
-        .select(
-            "id, license_key, active, max_devices, expires_at, app_user_id, notes"
+    # 2) licență
+    try:
+        res_lic = (
+            supabase.table("licenses")
+            .select(
+                "id, license_key, active, max_devices, expires_at, app_user_id, notes"
+            )
+            .eq("app_user_id", user["id"])
+            .maybe_single()
+            .execute()
         )
-        .eq("app_user_id", user["id"])
-        .maybe_single()
-        .execute()
-        .data
-    )
+    except Exception as e:
+        app.logger.exception("Supabase error la load_license_for_email (license): %s", e)
+        return None
+
+    lic = getattr(res_lic, "data", None)
     return lic
 
 
@@ -105,7 +134,10 @@ def home():
 # ------------------ License API (server-to-server) ------------------
 @app.post("/issue")
 def issue_license():
-    """Creează / reînnoiește licență (admin API). Body: email, days, max_devices, notes?"""
+    """
+    Creează / reînnoiește licență (admin API).
+    Body JSON: { "email", "days"?, "max_devices"?, "notes"? }
+    """
     if not _require_admin_api(request):
         return _json_error("Unauthorized", 401)
 
@@ -119,14 +151,19 @@ def issue_license():
         return _json_error("email required")
 
     app_user_id = get_or_create_user(email)
-    lic = (
-        supabase.table("licenses")
-        .select("id, expires_at, active, license_key, max_devices")
-        .eq("app_user_id", app_user_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    try:
+        res_lic = (
+            supabase.table("licenses")
+            .select("id, expires_at, active, license_key, max_devices")
+            .eq("app_user_id", app_user_id)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        app.logger.exception("Supabase error la issue_license (select): %s", e)
+        return _json_error("Eroare internă (license select).", 500)
+
+    lic = getattr(res_lic, "data", None)
 
     new_expires = _now() + timedelta(days=days)
     payload = {
@@ -183,9 +220,7 @@ def renew():
 
     base = lic.get("expires_at")
     base_dt = (
-        datetime.fromisoformat(base.replace("Z", "+00:00"))
-        if base
-        else _now()
+        datetime.fromisoformat(base.replace("Z", "+00:00")) if base else _now()
     )
     new_expires = max(base_dt, _now()) + timedelta(days=days)
 
@@ -193,7 +228,9 @@ def renew():
         {"expires_at": new_expires.isoformat(), "active": True}
     ).eq("id", lic["id"]).execute()
 
-    return jsonify({"status": "ok", "email": email, "expires_at": new_expires.isoformat()})
+    return jsonify(
+        {"status": "ok", "email": email, "expires_at": new_expires.isoformat()}
+    )
 
 
 @app.post("/suspend")
@@ -217,6 +254,10 @@ def suspend():
 # ------------------ Client API (/bind, /check) ------------------
 @app.post("/bind")
 def bind_device():
+    """
+    Leagă un dispozitiv (fingerprint) de licența unui email.
+    Body JSON: { "email", "fingerprint" }
+    """
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     fingerprint = (data.get("fingerprint") or "").strip()
@@ -236,13 +277,13 @@ def bind_device():
         return _json_error("license expired", 403)
 
     # câte device-uri legate?
-    devs = (
+    res_devs = (
         supabase.table("devices")
         .select("id, fingerprint")
         .eq("license_id", lic["id"])
         .execute()
-        .data
     )
+    devs = getattr(res_devs, "data", []) or []
     fset = {d["fingerprint"] for d in devs}
 
     if fingerprint in fset:
@@ -260,6 +301,16 @@ def bind_device():
 
 @app.post("/check")
 def check_device():
+    """
+    Verifică licența pentru un client și device:
+    Body JSON: { "email", "fingerprint" }
+    Răspuns:
+      - {status: "ok", expires_at}        -> licență activă și device legat
+      - {status: "inactive", ...}         -> licență inactivă
+      - {status: "expired", ...}          -> licență expirată
+      - {status: "unbound", ...}          -> device nelogat (trebuie /bind)
+      - error JSON cu 4xx                 -> lipsă licență etc.
+    """
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     fingerprint = (data.get("fingerprint") or "").strip()
@@ -279,15 +330,15 @@ def check_device():
         return jsonify({"status": "expired", "expires_at": lic["expires_at"]}), 200
 
     # verifică dacă fingerprint-ul e legat
-    dev = (
+    res_dev = (
         supabase.table("devices")
         .select("id")
         .eq("license_id", lic["id"])
         .eq("fingerprint", fingerprint)
         .maybe_single()
         .execute()
-        .data
     )
+    dev = getattr(res_dev, "data", None)
     if not dev:
         return jsonify({"status": "unbound", "expires_at": lic["expires_at"]}), 200
 
@@ -347,7 +398,7 @@ def admin_logout():
 def _fetch_rows_for_admin():
     """Citește rândurile panoului din view; dacă lipsește, face join din cod."""
     try:
-        data = (
+        res = (
             supabase.table("v_admin_licenses")
             .select(
                 "email, license_id, license_key, active, max_devices, expires_at, notes, created_at"
@@ -355,12 +406,12 @@ def _fetch_rows_for_admin():
             .order("created_at", desc=True)
             .limit(500)
             .execute()
-            .data
         )
+        data = getattr(res, "data", []) or []
         return data
     except Exception:
         # fallback join (în caz că nu ai creat view-ul)
-        lics = (
+        lics_res = (
             supabase.table("licenses")
             .select(
                 "id, license_key, active, max_devices, expires_at, app_user_id, notes, created_at"
@@ -368,18 +419,18 @@ def _fetch_rows_for_admin():
             .order("created_at", desc=True)
             .limit(500)
             .execute()
-            .data
         )
+        lics = getattr(lics_res, "data", []) or []
         ids = list({r["app_user_id"] for r in lics if r.get("app_user_id")})
         users = {}
         if ids:
-            urows = (
+            urows_res = (
                 supabase.table("app_users")
                 .select("id, email")
                 .in_("id", ids)
                 .execute()
-                .data
             )
+            urows = getattr(urows_res, "data", []) or []
             users = {u["id"]: u["email"] for u in urows}
         out = []
         for r in lics:
@@ -400,7 +451,9 @@ def _fetch_rows_for_admin():
 
 @app.get("/admin")
 def admin_home():
-    _require_admin()
+    guard = _require_admin()
+    if guard:
+        return guard
     rows = _fetch_rows_for_admin()
     return render_template_string(
         """
@@ -467,13 +520,13 @@ def admin_home():
         <td style="min-width:260px">
           <div style="display:flex;gap:8px">
             <input id="note-{{r.license_id}}" class="grow" value="{{r.notes|e}}" placeholder="Notițe..." />
-            <button class="btn-sm secondary" onclick="saveNote('{{r.license_id}}')">Save</button>
+            <button class="btn-sm secondary" type="button" onclick="saveNote('{{r.license_id}}')">Save</button>
           </div>
         </td>
         <td>
           <div class="row" style="margin:0">
-            <button class="btn-sm" onclick="quickRenew('{{r.email}}', 30)">RENEW +30</button>
-            <button class="btn-sm secondary" onclick="quickSuspend('{{r.email}}')">SUSPEND</button>
+            <button class="btn-sm" type="button" onclick="quickRenew('{{r.email}}', 30)">RENEW +30</button>
+            <button class="btn-sm secondary" type="button" onclick="quickSuspend('{{r.email}}')">SUSPEND</button>
           </div>
         </td>
       </tr>
@@ -540,7 +593,9 @@ async function saveNote(license_id){
 
 @app.post("/admin/set_note")
 def admin_set_note():
-    _require_admin()
+    guard = _require_admin()
+    if guard:
+        return guard
     data = request.get_json(force=True, silent=True) or {}
     license_id = data.get("license_id")
     note = (data.get("note") or "").strip()
@@ -549,6 +604,8 @@ def admin_set_note():
 
     supabase.table("licenses").update({"notes": note}).eq("id", license_id).execute()
     return jsonify({"status": "ok"})
+
+
 # ------------------ main ------------------
 if __name__ == "__main__":
     # Pentru rulare locală (Render folosește gunicorn/WSGI implicit)
