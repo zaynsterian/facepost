@@ -302,47 +302,45 @@ def bind_device():
 @app.post("/check")
 def check_device():
     """
-    Verifică licența pentru un client și device:
-    Body JSON: { "email", "fingerprint" }
-    Răspuns:
-      - {status: "ok", expires_at}        -> licență activă și device legat
-      - {status: "inactive", ...}         -> licență inactivă
-      - {status: "expired", ...}          -> licență expirată
-      - {status: "unbound", ...}          -> device nelogat (trebuie /bind)
-      - error JSON cu 4xx                 -> lipsă licență etc.
+    Verifică licența DOAR pe baza de email (fără device lock deocamdată).
+    Body JSON așteptat: { "email": "..." , "fingerprint": "..." } 
+    - fingerprint este ignorat momentan, ca să fie compatibil cu clientul.
     """
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
-    fingerprint = (data.get("fingerprint") or "").strip()
 
-    if not email or not fingerprint:
-        return _json_error("email and fingerprint required")
+    if not email:
+        return _json_error("email required")
 
     lic = load_license_for_email(email)
     if not lic:
         return _json_error("license not found", 404)
 
+    # licență inactivă
     if not lic.get("active"):
-        return jsonify({"status": "inactive", "expires_at": lic.get("expires_at")}), 200
+        return jsonify({
+            "status": "inactive",
+            "expires_at": lic.get("expires_at")
+        }), 200
 
-    expires_at = datetime.fromisoformat(lic["expires_at"].replace("Z", "+00:00"))
-    if expires_at < _now():
-        return jsonify({"status": "expired", "expires_at": lic["expires_at"]}), 200
+    # licență expirată
+    expires_at_str = lic.get("expires_at")
+    if expires_at_str:
+        try:
+            expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+            if expires_at < _now():
+                return jsonify({
+                    "status": "expired",
+                    "expires_at": expires_at_str
+                }), 200
+        except Exception:
+            app.logger.warning("Nu pot parsa expires_at: %r", expires_at_str)
 
-    # verifică dacă fingerprint-ul e legat
-    res_dev = (
-        supabase.table("devices")
-        .select("id")
-        .eq("license_id", lic["id"])
-        .eq("fingerprint", fingerprint)
-        .maybe_single()
-        .execute()
-    )
-    dev = getattr(res_dev, "data", None)
-    if not dev:
-        return jsonify({"status": "unbound", "expires_at": lic["expires_at"]}), 200
-
-    return jsonify({"status": "ok", "expires_at": lic["expires_at"]}), 200
+    # dacă am ajuns aici => licență validă
+    return jsonify({
+        "status": "ok",
+        "expires_at": lic.get("expires_at")
+    }), 200
 
 
 # ------------------ Admin Panel ------------------
