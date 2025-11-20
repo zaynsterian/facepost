@@ -74,7 +74,7 @@ def load_best_license_for_email(email: str):
     Întoarce „cea mai bună” licență pentru email:
     - caută user
     - ia TOATE licențele lui
-    - returnează prima licență activă și ne-expirată,
+    - returnează prima activă și ne-expirată,
       preferând una non-trial în fața uneia de trial.
     """
     email = (email or "").strip().lower()
@@ -126,7 +126,6 @@ def load_best_license_for_email(email: str):
             # preferăm licențele non-trial
             if best.get("is_trial", False) and not lic.get("is_trial", False):
                 best = lic
-            # altfel lăsăm best cum e
 
     return best
 
@@ -673,4 +672,5 @@ def admin_set_note():
 
 # ------------------ main ------------------
 if __name__ == "__main__":
+    # Pentru rulare locală; pe Render se folosește gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
