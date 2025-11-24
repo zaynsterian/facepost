@@ -21,19 +21,23 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
-app.register_blueprint(updates_bp)
 
-UTC = timezone.utc
+# Blueprint pentru updates
+app.register_blueprint(updates_bp)
 
 
 # ------------------ Helpers ------------------
 def _now():
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
-def _require_admin_api(req: request):
-    key = req.headers.get("X-Admin-Key", "")
-    return bool(key and ADMIN_API_KEY and key == ADMIN_API_KEY)
+def _json_error(msg, code=400):
+    return jsonify({"error": msg}), code
+
+
+def _require_admin_api(req):
+    key = req.headers.get("X-Admin-Key")
+    return key and key == (ADMIN_API_KEY or "")
 
 
 def _require_admin():
@@ -41,12 +45,8 @@ def _require_admin():
         return redirect("/admin/login")
 
 
-def _json_error(msg, code=400):
-    return jsonify({"error": msg}), code
-
-
 def get_or_create_user(email: str) -> str:
-    """Returnează app_users.id pentru email; îl creează dacă lipsește."""
+    """Returnează app_user_id pentru email, creând userul dacă nu există."""
     email = (email or "").strip().lower()
     if not email:
         raise ValueError("email required")
@@ -68,7 +68,6 @@ def get_or_create_user(email: str) -> str:
 
 
 def user_has_trial_license(user_id: str) -> bool:
-    """True dacă userul a avut vreodată o licență trial."""
     res = (
         supabase.table("licenses")
         .select("id")
@@ -91,7 +90,7 @@ def create_trial_license_for_user(user_id: str):
         "app_user_id": user_id,
         "license_key": license_key,
         "active": True,
-        "max_devices": 2,  # ✅ default 2 devices
+        "max_devices": 1,  # default 1 device
         "expires_at": trial_expires.isoformat(),
         "notes": "Free trial 14 days",
         "is_trial": True,
@@ -123,12 +122,12 @@ def load_best_license_for_email(email: str):
     if not user:
         return None
 
+    user_id = user["id"]
+
     res_lics = (
         supabase.table("licenses")
-        .select(
-            "id, license_key, active, max_devices, expires_at, app_user_id, notes, is_trial, created_at"
-        )
-        .eq("app_user_id", user["id"])
+        .select("id, license_key, active, max_devices, expires_at, is_trial, app_user_id, notes")
+        .eq("app_user_id", user_id)
         .execute()
     )
     lics = getattr(res_lics, "data", []) or []
@@ -147,37 +146,27 @@ def load_best_license_for_email(email: str):
                 if exp_dt < now:
                     return False
             except Exception:
-                pass
+                return False
         return True
 
-    # activ & valid
-    valid_lics = [l for l in lics if valid(l)]
-    if not valid_lics:
+    # sortăm: non-trial înaintea trial
+    lics = [l for l in lics if valid(l)]
+    if not lics:
         return None
 
-    # preferăm plătite înaintea trial
-    paid = [l for l in valid_lics if not l.get("is_trial")]
-    if paid:
-        # cea mai nouă plătită
-        paid.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-        return paid[0]
-
-    # altfel cea mai nouă trial
-    valid_lics.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-    return valid_lics[0]
+    lics_sorted = sorted(lics, key=lambda l: (l.get("is_trial", False), l.get("expires_at", "")))
+    return lics_sorted[0]
 
 
 def find_license_for_device(email: str, fingerprint: str):
     """
-    Dacă device-ul era legat pe o licență veche, o găsim și o acceptăm.
-    Evită false 'unbound' după update-uri.
+    Caută orice licență activă + neexpirată a userului
+    pe care e legat device-ul (în tabela devices).
     """
     email = (email or "").strip().lower()
-    fingerprint = (fingerprint or "").strip()
     if not email or not fingerprint:
         return None
 
-    # user
     res_user = (
         supabase.table("app_users")
         .select("id")
@@ -188,9 +177,9 @@ def find_license_for_device(email: str, fingerprint: str):
     user = getattr(res_user, "data", None)
     if not user:
         return None
+
     user_id = user["id"]
 
-    # licențele userului
     res_lics = (
         supabase.table("licenses")
         .select("id, license_key, active, max_devices, expires_at, is_trial")
@@ -209,14 +198,14 @@ def find_license_for_device(email: str, fingerprint: str):
         .select("license_id, fingerprint")
         .eq("fingerprint", fingerprint)
         .in_("license_id", lic_ids)
-        .maybe_single()
         .execute()
     )
     dev = getattr(res_dev, "data", None)
     if not dev:
         return None
+    dev = dev[0]
 
-    # întoarce licența pe care era legat
+    # întoarce licența corespunzătoare dacă e validă
     for l in lics:
         if l["id"] == dev["license_id"]:
             return l
@@ -243,7 +232,7 @@ def issue_license():
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     days = int(data.get("days") or 30)
-    max_devices = int(data.get("max_devices") or 2)  # ✅ default 2
+    max_devices = int(data.get("max_devices") or 1)  # default 1
     notes = (data.get("notes") or "").strip()
 
     if not email:
@@ -265,7 +254,7 @@ def issue_license():
     new_expires = _now() + timedelta(days=days)
     payload = {
         "active": True,
-        "max_devices": max(2, max_devices),  # ✅ minim 2
+        "max_devices": max(1, max_devices),  # minim 1
         "expires_at": new_expires.isoformat(),
         "notes": notes,
         "is_trial": False,
@@ -281,6 +270,7 @@ def issue_license():
         payload.update(
             {"id": license_id, "app_user_id": app_user_id, "license_key": license_key}
         )
+
         supabase.table("licenses").insert(payload).execute()
 
     return jsonify({
@@ -304,21 +294,54 @@ def renew():
     if not email:
         return _json_error("email required")
 
-    lic = load_best_license_for_email(email)
+    res_user = (
+        supabase.table("app_users")
+        .select("id")
+        .eq("email", email)
+        .maybe_single()
+        .execute()
+    )
+    user = getattr(res_user, "data", None)
+    if not user:
+        return _json_error("user not found", 404)
+
+    app_user_id = user["id"]
+
+    res_lic = (
+        supabase.table("licenses")
+        .select("id, expires_at, active")
+        .eq("app_user_id", app_user_id)
+        .eq("is_trial", False)
+        .maybe_single()
+        .execute()
+    )
+    lic = getattr(res_lic, "data", None)
     if not lic:
-        return _json_error("license not found", 404)
+        return _json_error("paid license not found", 404)
 
-    base = lic.get("expires_at")
-    base_dt = datetime.fromisoformat(base.replace("Z", "+00:00")) if base else _now()
-    new_expires = max(base_dt, _now()) + timedelta(days=days)
+    now = _now()
+    current_exp = lic.get("expires_at")
+    if current_exp:
+        try:
+            exp_dt = datetime.fromisoformat(current_exp.replace("Z", "+00:00"))
+        except Exception:
+            exp_dt = now
+    else:
+        exp_dt = now
 
-    supabase.table("licenses").update({
-        "expires_at": new_expires.isoformat(),
-        "active": True,
-        "is_trial": False
-    }).eq("id", lic["id"]).execute()
+    base = exp_dt if exp_dt > now else now
+    new_exp = base + timedelta(days=days)
 
-    return jsonify({"status": "ok", "email": email, "expires_at": new_expires.isoformat()}), 200
+    supabase.table("licenses").update(
+        {"expires_at": new_exp.isoformat(), "active": True}
+    ).eq("id", lic["id"]).execute()
+
+    return jsonify({
+        "status": "ok",
+        "email": email,
+        "license_id": lic["id"],
+        "expires_at": new_exp.isoformat(),
+    }), 200
 
 
 @app.post("/suspend")
@@ -331,17 +354,26 @@ def suspend():
     if not email:
         return _json_error("email required")
 
-    lic = load_best_license_for_email(email)
-    if not lic:
-        return _json_error("license not found", 404)
+    res_user = (
+        supabase.table("app_users")
+        .select("id")
+        .eq("email", email)
+        .maybe_single()
+        .execute()
+    )
+    user = getattr(res_user, "data", None)
+    if not user:
+        return _json_error("user not found", 404)
 
-    supabase.table("licenses").update({"active": False}).eq("id", lic["id"]).execute()
-    return jsonify({"status": "ok", "email": email}), 200
+    app_user_id = user["id"]
+
+    supabase.table("licenses").update({"active": False}).eq("app_user_id", app_user_id).execute()
+    return jsonify({"status": "ok"}), 200
 
 
 @app.post("/trial")
-def enable_trial():
-    """Admin: activează trial 14 zile pentru user."""
+def create_trial():
+    """Admin API: forțează crearea unei licențe trial de 14 zile, dacă nu există."""
     if not _require_admin_api(request):
         return _json_error("Unauthorized", 401)
 
@@ -397,24 +429,38 @@ def bind_device():
     if not lic.get("active"):
         return _json_error("license inactive", 403)
 
-    expires_at = datetime.fromisoformat(lic["expires_at"].replace("Z", "+00:00"))
-    if expires_at < _now():
-        return _json_error("license expired", 403)
+    expires_at = lic.get("expires_at")
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if exp_dt < _now():
+                return _json_error("license expired", 403)
+        except Exception:
+            return _json_error("expires_at invalid", 500)
 
-    devs = (
+    # verificăm dacă device-ul este deja legat la licența aceasta
+    res_dev = (
         supabase.table("devices")
-        .select("id, fingerprint")
+        .select("id")
+        .eq("license_id", lic["id"])
+        .eq("fingerprint", fingerprint)
+        .maybe_single()
+        .execute()
+    )
+    dev = getattr(res_dev, "data", None)
+    if dev:
+        return jsonify({"status": "ok"}), 200
+
+    # număr de device-uri legate la licență
+    res_devs = (
+        supabase.table("devices")
+        .select("id")
         .eq("license_id", lic["id"])
         .execute()
-        .data
-    ) or []
-    fset = {d["fingerprint"] for d in devs}
-
-    if fingerprint in fset:
-        return jsonify({"status": "ok"})  # deja legat
-
-    if len(fset) >= int(lic.get("max_devices") or 2):
-        return _json_error("device limit reached", 403)
+    )
+    devs = getattr(res_devs, "data", []) or []
+    if len(devs) >= int(lic.get("max_devices") or 1):
+        return _json_error("too many devices bound to this license", 403)
 
     supabase.table("devices").insert(
         {"id": str(uuid4()), "license_id": lic["id"], "fingerprint": fingerprint}
@@ -465,13 +511,13 @@ def check_device():
         .eq("fingerprint", fingerprint)
         .maybe_single()
         .execute()
-        .data
-    )
+    ).data
     if dev:
         return jsonify({
             "status": "ok",
             "expires_at": lic["expires_at"],
             "is_trial": lic.get("is_trial", False),
+            "note": "device already bound to best license",
         }), 200
 
     # 2) dacă device-ul era legat pe ALTA licență a aceluiași user → acceptăm aia
@@ -498,7 +544,7 @@ def check_device():
     ) or []
     fset = {d["fingerprint"] for d in devs}
 
-    if len(fset) < int(lic.get("max_devices") or 2):
+    if len(fset) < int(lic.get("max_devices") or 1):
         supabase.table("devices").insert(
             {"id": str(uuid4()), "license_id": lic["id"], "fingerprint": fingerprint}
         ).execute()
@@ -506,7 +552,7 @@ def check_device():
             "status": "ok",
             "expires_at": lic["expires_at"],
             "is_trial": lic.get("is_trial", False),
-            "auto_bound": True
+            "note": "auto-bound device to license"
         }), 200
 
     # dacă nu mai e loc → unbound real
@@ -515,6 +561,38 @@ def check_device():
         "expires_at": lic["expires_at"],
         "is_trial": lic.get("is_trial", False),
     }), 200
+
+
+@app.post("/log_run")
+def log_run():
+    """Primește log pentru fiecare RUN (email + fingerprint + grupuri + text + nr. imagini)."""
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    fingerprint = (data.get("fingerprint") or "").strip()
+
+    if not email:
+        return _json_error("email required")
+
+    app_user_id = get_or_create_user(email)
+
+    group_urls = data.get("group_urls") or ""
+    post_text = data.get("post_text") or ""
+    try:
+        images_count = int(data.get("images_count") or 0)
+    except Exception:
+        images_count = 0
+
+    payload = {
+        "app_user_id": app_user_id,
+        "email": email,
+        "fingerprint": fingerprint,
+        "group_urls": group_urls,
+        "post_text": post_text,
+        "images_count": images_count,
+    }
+
+    supabase.table("run_logs").insert(payload).execute()
+    return jsonify({"status": "ok"}), 200
 
 
 # ------------------ Admin Panel ------------------
@@ -529,7 +607,7 @@ def admin_login_page():
 <title>Login - {{app}}</title>
 <style>
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#f6f7fb;margin:0}
- .wrap{max-width:560px;margin:8vh auto;background:#fff;padding:28px 28px 34px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.07)}
+ .wrap{max-width:560px;margin:8vh auto;background:#fff;padding:26px 28px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.07)}
  h1{margin:0 0 18px;font-size:22px}
  input,button{font-size:16px;padding:12px 14px;border-radius:10px;border:1px solid #d8dbe2;width:100%}
  button{background:#7b4fe0;color:#fff;border:none;cursor:pointer}
@@ -542,8 +620,8 @@ def admin_login_page():
     <div class="row"><input name="user" placeholder="User" autocomplete="username" /></div>
     <div class="row"><input name="pass" placeholder="Password" type="password" autocomplete="current-password" /></div>
     <div class="row"><button type="submit">Login</button></div>
-    <div class="note">Folosește credențialele din env <b>ADMIN_USER</b> / <b>ADMIN_PASS</b>.</div>
   </form>
+  <div class="note">Folosim sesiune simplă pe cookie; logout din /admin/logout.</div>
 </div>
 """,
         app=APP_NAME,
@@ -551,13 +629,13 @@ def admin_login_page():
 
 
 @app.post("/admin/login")
-def admin_login():
-    user = request.form.get("user", "")
-    pw = request.form.get("pass", "")
-    if user == ADMIN_USER and pw == ADMIN_PASS:
+def admin_login_action():
+    user = (request.form.get("user") or "").strip()
+    pw = (request.form.get("pass") or "").strip()
+    if user == (ADMIN_USER or "admin") and pw == (ADMIN_PASS or "admin"):
         session["admin_ok"] = True
         return redirect("/admin")
-    return _json_error("Unauthorized", 401)
+    return "Invalid credentials", 403
 
 
 @app.get("/admin/logout")
@@ -567,55 +645,51 @@ def admin_logout():
 
 
 def _fetch_rows_for_admin():
-    """Citește rândurile panoului din view; dacă lipsește, face join din cod."""
-    try:
-        data = (
-            supabase.table("v_admin_licenses")
-            .select(
-                "email, license_id, license_key, active, max_devices, expires_at, notes, created_at, is_trial"
-            )
-            .order("created_at", desc=True)
-            .limit(500)
-            .execute()
-            .data
+    """
+    Returnează o listă de licențe cu user & info, ordonată desc după created_at.
+    """
+    # luăm toate licențele cu user
+    res = (
+        supabase.table("licenses")
+        .select(
+            "id, license_key, active, max_devices, expires_at, app_user_id, notes, created_at, is_trial"
         )
-        return data
-    except Exception:
-        lics = (
-            supabase.table("licenses")
-            .select(
-                "id, license_key, active, max_devices, expires_at, app_user_id, notes, created_at, is_trial"
-            )
-            .order("created_at", desc=True)
-            .limit(500)
-            .execute()
-            .data
-        )
-        ids = list({r["app_user_id"] for r in lics if r.get("app_user_id")})
-        users = {}
-        if ids:
-            urows = (
-                supabase.table("app_users")
-                .select("id, email")
-                .in_("id", ids)
-                .execute()
-                .data
-            )
-            users = {u["id"]: u["email"] for u in urows}
-        out = []
-        for r in lics:
-            out.append({
-                "email": users.get(r["app_user_id"], "(unknown)"),
-                "license_id": r["id"],
-                "license_key": r["license_key"],
-                "active": r["active"],
-                "max_devices": r["max_devices"],
-                "expires_at": r["expires_at"],
-                "notes": r.get("notes") or "",
-                "created_at": r.get("created_at"),
-                "is_trial": r.get("is_trial", False),
-            })
-        return out
+        .order("created_at", desc=True)
+        .limit(500)
+        .execute()
+    )
+    lics = getattr(res, "data", []) or []
+    if not lics:
+        return []
+
+    # map user_id -> email
+    user_ids = list({l["app_user_id"] for l in lics if l.get("app_user_id")})
+    if not user_ids:
+        return []
+    res_users = (
+        supabase.table("app_users")
+        .select("id, email")
+        .in_("id", user_ids)
+        .execute()
+    )
+    users = getattr(res_users, "data", []) or []
+    email_map = {u["id"]: u["email"] for u in users}
+
+    out = []
+    for r in lics:
+        email = email_map.get(r["app_user_id"], "??")
+        out.append({
+            "email": email,
+            "license_id": r["id"],
+            "license_key": r["license_key"],
+            "active": r["active"],
+            "max_devices": r["max_devices"],
+            "expires_at": r["expires_at"],
+            "notes": r.get("notes") or "",
+            "created_at": r.get("created_at"),
+            "is_trial": r.get("is_trial", False),
+        })
+    return out
 
 
 @app.get("/admin")
@@ -657,9 +731,9 @@ def admin_home():
     <div class="row">
       <input class="grow" name="email" placeholder="Email client" required />
       <input style="width:120px" name="days" type="number" value="30" />
-      <input style="width:140px" name="max_devices" type="number" value="2" />
+      <input style="width:140px" name="max_devices" type="number" value="1" />
       <input class="grow" name="notes" placeholder="Notițe (nume unitate etc.)" />
-      <button type="submit">CREEAZĂ / PRELUNGEȘTE</button>
+      <button type="submit">CREAZĂ / RENEW</button>
     </div>
   </form>
 
@@ -667,12 +741,12 @@ def admin_home():
   <table>
     <thead>
       <tr>
-        <th>Email</th>
+        <th>Email / Key</th>
         <th>Status</th>
-        <th>Expiră</th>
-        <th>Licență</th>
+        <th>Expiră la</th>
+        <th>License ID</th>
         <th>Notițe</th>
-        <th style="width:320px">Acțiuni</th>
+        <th>Acțiuni</th>
       </tr>
     </thead>
     <tbody>
@@ -702,6 +776,7 @@ def admin_home():
             <button class="btn-sm" onclick="quickRenew('{{r.email}}', 30)">RENEW +30</button>
             <button class="btn-sm secondary" onclick="quickSuspend('{{r.email}}')">SUSPEND</button>
             <button class="btn-sm secondary" onclick="quickTrial('{{r.email}}')">ENABLE TRIAL 14</button>
+            <button class="btn-sm secondary" onclick="viewLogs('{{r.email}}')">LOGS</button>
           </div>
         </td>
       </tr>
@@ -717,7 +792,7 @@ async function doIssue(e){
   const body = {
     email: f.email.value.trim(),
     days: parseInt(f.days.value||30),
-    max_devices: parseInt(f.max_devices.value||2),
+    max_devices: parseInt(f.max_devices.value||1),
     notes: f.notes.value||""
   };
   const r = await fetch('/issue', {
@@ -757,6 +832,10 @@ async function quickTrial(email){
   if(r.ok){ location.reload(); } else { alert('Trial error / deja folosit'); }
 }
 
+async function viewLogs(email){
+  window.location.href = '/admin/logs?email=' + encodeURIComponent(email);
+}
+
 async function saveNote(license_id){
   const note = document.getElementById('note-'+license_id).value;
   const r = await fetch('/admin/set_note', {
@@ -771,6 +850,81 @@ async function saveNote(license_id){
         app=APP_NAME,
         rows=rows,
         admin_key=ADMIN_API_KEY or "",
+    )
+
+
+@app.get("/admin/logs")
+def admin_logs():
+    """Afișează logs de RUN pentru un anumit email."""
+    _require_admin()
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return _json_error("email required")
+
+    app_user_id = get_or_create_user(email)
+
+    rows = (
+        supabase.table("run_logs")
+        .select("created_at, group_urls, post_text, images_count")
+        .eq("app_user_id", app_user_id)
+        .order("created_at", desc=True)
+        .limit(300)
+        .execute()
+        .data
+    ) or []
+
+    return render_template_string(
+        """<!doctype html>
+<title>Logs - {{email}}</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#f6f7fb;margin:0}
+ header{display:flex;justify-content:space-between;align-items:center;padding:18px 26px;background:#fff;border-bottom:1px solid #e7e9f0}
+ h1{font-size:20px;margin:0}
+ a.btn{padding:8px 12px;border-radius:8px;border:1px solid #d8dbe2;background:#edf0f8;color:#333;text-decoration:none}
+ .container{max-width:1100px;margin:18px auto;padding:0 18px}
+ table{width:100%;border-collapse:separate;border-spacing:0 8px}
+ th,td{padding:8px 10px;background:#fff;border-top:1px solid #e9edf5;border-bottom:1px solid #e9edf5;font-size:13px;vertical-align:top}
+ th:first-child,td:first-child{border-left:1px solid #e9edf5;border-top-left-radius:8px;border-bottom-left-radius:8px}
+ th:last-child,td:last-child{border-right:1px solid #e9edf5;border-top-right-radius:8px;border-bottom-right-radius:8px}
+ .muted{color:#667;font-size:12px}
+ pre{white-space:pre-wrap;font-family:inherit;margin:0}
+ .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+</style>
+
+<header>
+  <h1>Logs pentru {{email}}</h1>
+  <a href="/admin" class="btn">Înapoi la admin</a>
+</header>
+
+<div class="container">
+  {% if not rows %}
+    <p class="muted">Nu există runde logate pentru acest user.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Data</th>
+          <th>Grupuri</th>
+          <th>Text postare</th>
+          <th>Imagini</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td class="mono">{{ r.created_at }}</td>
+          <td><pre>{{ (r.group_urls or '')[:1000] }}</pre></td>
+          <td><pre>{{ (r.post_text or '')[:1000] }}</pre></td>
+          <td>{{ r.images_count or 0 }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+""",
+        email=email,
+        rows=rows,
     )
 
 
