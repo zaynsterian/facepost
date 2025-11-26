@@ -485,9 +485,14 @@ def bind_device():
 def check_device():
     """
     Verifică licența pentru email + fingerprint.
-    ✅ Fix anti-unbound:
-      - dacă device-ul e legat pe altă licență activă a userului, o acceptăm
-      - dacă nu e legat dar e loc, îl auto-binam
+
+    Comportament:
+      - dacă există o licență activă & neexpirată pe care e deja legat device-ul → status "ok"
+      - dacă există o altă licență activă & neexpirată a aceluiași user pe care e legat device-ul → status "ok" + note
+      - dacă există licență activă & neexpirată dar device-ul NU este legat și mai e loc → status "unbound"
+      - dacă există doar licențe expirate sau suspendate → status "expired" sau "inactive"
+      - dacă nu există nicio licență pentru email → eroare 404 "license not found"
+      - dacă licența activă e plină ca număr de device-uri → eroare 403 "device limit reached"
     """
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
@@ -496,30 +501,82 @@ def check_device():
     if not email or not fingerprint:
         return _json_error("email and fingerprint required")
 
-    lic = load_best_license_for_email(email)
-    if not lic:
+    # 1) Găsim userul
+    res_user = (
+        supabase.table("app_users")
+        .select("id")
+        .eq("email", email)
+        .maybe_single()
+        .execute()
+    )
+    user = getattr(res_user, "data", None)
+    if not user:
+        # niciun user => nici licență
         return _json_error("license not found", 404)
 
-    if not lic.get("active"):
+    user_id = user["id"]
+
+    # 2) Luăm toate licențele userului
+    res_lics = (
+        supabase.table("licenses")
+        .select(
+            "id, license_key, active, max_devices, expires_at, app_user_id, notes, is_trial, created_at"
+        )
+        .eq("app_user_id", user_id)
+        .execute()
+    )
+    lics = getattr(res_lics, "data", []) or []
+    if not lics:
+        return _json_error("license not found", 404)
+
+    now = _now()
+
+    def is_valid(lic):
+        if not lic.get("active"):
+            return False
+        exp = lic.get("expires_at")
+        if exp:
+            try:
+                exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            except Exception:
+                return False
+            if exp_dt < now:
+                return False
+        return True
+
+    valid_lics = [l for l in lics if is_valid(l)]
+
+    if not valid_lics:
+        # Avem licențe dar niciuna validă acum → fie sunt expirate, fie suspendate
+        # Determinăm un status agregat pentru UI
+        any_active_flag = any(l.get("active") for l in lics)
+        if any_active_flag:
+            agg_status = "expired"
+        else:
+            agg_status = "inactive"
+
+        # Luăm ultima licență (după expires_at / created_at) doar pentru afișare
+        def _sort_key(lic):
+            return (
+                lic.get("expires_at") or "",
+                lic.get("created_at") or "",
+            )
+
+        last_lic = sorted(lics, key=_sort_key)[-1]
         return jsonify(
             {
-                "status": "inactive",
-                "expires_at": lic.get("expires_at"),
-                "is_trial": lic.get("is_trial", False),
+                "status": agg_status,
+                "expires_at": last_lic.get("expires_at"),
+                "is_trial": last_lic.get("is_trial", False),
             }
         ), 200
 
-    expires_at = datetime.fromisoformat(lic["expires_at"].replace("Z", "+00:00"))
-    if expires_at < _now():
-        return jsonify(
-            {
-                "status": "expired",
-                "expires_at": lic["expires_at"],
-                "is_trial": lic.get("is_trial", False),
-            }
-        ), 200
+    # Alegem "cea mai bună" licență validă, preferând non-trial
+    lic = sorted(
+        valid_lics, key=lambda l: (l.get("is_trial", False), l.get("expires_at") or "")
+    )[0]
 
-    # 1) dacă device-ul e legat deja la licența aleasă
+    # 3) dacă device-ul e legat deja la licența aleasă
     dev = (
         supabase.table("devices")
         .select("id")
@@ -538,24 +595,31 @@ def check_device():
             }
         ), 200
 
-    # 2) dacă device-ul era legat pe ALTA licență a aceluiași user → acceptăm aia
+    # 4) dacă device-ul era legat pe ALTA licență activă a aceluiași user → acceptăm aia
     alt_lic = find_license_for_device(email, fingerprint)
     if alt_lic:
-        if alt_lic.get("active"):
-            alt_exp = datetime.fromisoformat(
-                alt_lic["expires_at"].replace("Z", "+00:00")
-            )
-            if alt_exp >= _now():
-                return jsonify(
-                    {
-                        "status": "ok",
-                        "expires_at": alt_lic["expires_at"],
-                        "is_trial": alt_lic.get("is_trial", False),
-                        "note": "device matched older license",
-                    }
-                ), 200
+        # find_license_for_device caută deja licențe active + neexpirate,
+        # dar mai facem un sanity-check pe expirare
+        alt_exp_str = alt_lic.get("expires_at")
+        if alt_exp_str:
+            try:
+                alt_exp = datetime.fromisoformat(alt_exp_str.replace("Z", "+00:00"))
+            except Exception:
+                alt_exp = None
+        else:
+            alt_exp = None
 
-    # 3) auto-bind dacă mai e loc pe licența curentă
+        if alt_exp is None or alt_exp >= now:
+            return jsonify(
+                {
+                    "status": "ok",
+                    "expires_at": alt_lic.get("expires_at"),
+                    "is_trial": alt_lic.get("is_trial", False),
+                    "note": "device matched older license",
+                }
+            ), 200
+
+    # 5) device-ul NU este legat nicăieri încă → verificăm locurile disponibile
     devs = (
         supabase.table("devices")
         .select("id, fingerprint")
@@ -563,26 +627,22 @@ def check_device():
         .execute()
         .data
     ) or []
-    fset = {d["fingerprint"] for d in devs}
+    fingerprints = {d["fingerprint"] for d in devs}
+    max_devices = int(lic.get("max_devices") or 1)
 
-    if len(fset) < int(lic.get("max_devices") or 1):
-        supabase.table("devices").insert(
-            {"id": str(uuid4()), "license_id": lic["id"], "fingerprint": fingerprint}
-        ).execute()
-        return jsonify(
-            {
-                "status": "ok",
-                "expires_at": lic["expires_at"],
-                "is_trial": lic.get("is_trial", False),
-                "auto_bound": True,
-            }
-        ), 200
+    if len(fingerprints) >= max_devices and fingerprint not in fingerprints:
+        # licență plină → nu putem lega device-ul
+        return _json_error("device limit reached", 403)
 
+    # Există licență validă și mai este loc pentru device,
+    # dar NU facem bind automat aici – doar semnalăm status "unbound"
     return jsonify(
         {
             "status": "unbound",
             "expires_at": lic["expires_at"],
             "is_trial": lic.get("is_trial", False),
+            "max_devices": max_devices,
+            "used_devices": len(fingerprints),
         }
     ), 200
 
