@@ -222,6 +222,80 @@ def home():
 
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
+@app.post("/public_signup")
+def public_signup():
+    """
+    Endpoint apelat de formularul de pe site.
+    Primește: first_name, last_name, email, phone, accommodation_name.
+    1) Creează / găsește userul în app_users.
+    2) Creează / actualizează profilul în client_profiles.
+    3) Dacă nu există nicio licență activă:
+         - dacă NU are trial deja -> creează trial 14 zile
+         - altfel -> nu creează nimic nou.
+    Returnează JSON cu info despre licență.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+
+    first_name = (data.get("first_name") or "").strip()
+    last_name = (data.get("last_name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    phone = (data.get("phone") or "").strip()
+    accommodation_name = (data.get("accommodation_name") or "").strip()
+
+    if not email:
+        return _json_error("email required")
+
+    # 1) user în app_users
+    app_user_id = get_or_create_user(email)
+
+    # 2) profil în client_profiles (upsert by app_user_id)
+    profile_payload = {
+        "app_user_id": app_user_id,
+        "first_name": first_name,
+        "last_name": last_name,
+        "phone": phone,
+        "accommodation_name": accommodation_name,
+    }
+
+    # dacă ai creat index UNIQUE pe app_user_id, poți folosi upsert cu on_conflict
+    supabase.table("client_profiles").upsert(
+        profile_payload, on_conflict="app_user_id"
+    ).execute()
+
+    # 3) licență
+    lic = load_best_license_for_email(email)
+    created_trial = False
+
+    if not lic:
+        # vezi dacă a mai avut trial
+        if not user_has_trial_license(app_user_id):
+            lic = create_trial_license_for_user(app_user_id)
+            created_trial = True
+        else:
+            # are deja trial consumat, dar fără licență activă
+            lic = None
+
+    resp = {
+        "status": "ok",
+        "email": email,
+        "created_trial": created_trial,
+    }
+
+    if lic:
+        resp.update(
+            {
+                "license_id": lic["id"],
+                "license_key": lic["license_key"],
+                "expires_at": lic.get("expires_at"),
+                "max_devices": lic.get("max_devices"),
+                "is_trial": lic.get("is_trial", False),
+            }
+        )
+    else:
+        resp["license"] = None
+
+    return jsonify(resp), 200
+
 @app.post("/issue")
 def issue_license():
     """
