@@ -219,20 +219,24 @@ def find_license_for_device(email: str, fingerprint: str):
 def home():
     return f"{APP_NAME} OK", 200
 
-
-# ------------------ License API (admin: issue / renew / suspend) ------------------
-
 @app.post("/public_signup")
 def public_signup():
     """
-    Endpoint apelat de formularul de pe site.
-    Primește: first_name, last_name, email, phone, accommodation_name.
+    Endpoint apelat de formularul de pe site (Bolt).
+    Primește:
+      {
+        "first_name": "...",
+        "last_name": "...",
+        "email": "...",
+        "phone": "...",
+        "accommodation_name": "..."
+      }
+
     1) Creează / găsește userul în app_users.
     2) Creează / actualizează profilul în client_profiles.
     3) Dacă nu există nicio licență activă:
          - dacă NU are trial deja -> creează trial 14 zile
          - altfel -> nu creează nimic nou.
-    Returnează JSON cu info despre licență.
     """
     data = request.get_json(force=True, silent=True) or {}
 
@@ -248,7 +252,7 @@ def public_signup():
     # 1) user în app_users
     app_user_id = get_or_create_user(email)
 
-    # 2) profil în client_profiles (upsert by app_user_id)
+    # 2) profil în client_profiles – upsert by app_user_id
     profile_payload = {
         "app_user_id": app_user_id,
         "first_name": first_name,
@@ -257,28 +261,35 @@ def public_signup():
         "accommodation_name": accommodation_name,
     }
 
-    # dacă ai creat index UNIQUE pe app_user_id, poți folosi upsert cu on_conflict
-    supabase.table("client_profiles").upsert(
-        profile_payload, on_conflict="app_user_id"
-    ).execute()
+    try:
+        supabase.table("client_profiles").upsert(
+            profile_payload, on_conflict="app_user_id"
+        ).execute()
+    except Exception as e:
+        print("[PUBLIC_SIGNUP] Eroare la upsert client_profiles:", e)
+        # nu blocăm tot flow-ul dacă profilul e problematic
+        # doar raportăm mai jos în răspuns
+        profile_error = True
+    else:
+        profile_error = False
 
     # 3) licență
     lic = load_best_license_for_email(email)
     created_trial = False
 
     if not lic:
-        # vezi dacă a mai avut trial
+        # nu avem licență activă; vedem dacă mai poate primi trial
         if not user_has_trial_license(app_user_id):
             lic = create_trial_license_for_user(app_user_id)
             created_trial = True
         else:
-            # are deja trial consumat, dar fără licență activă
             lic = None
 
     resp = {
         "status": "ok",
         "email": email,
         "created_trial": created_trial,
+        "profile_saved": not profile_error,
     }
 
     if lic:
@@ -295,6 +306,8 @@ def public_signup():
         resp["license"] = None
 
     return jsonify(resp), 200
+
+# ------------------ License API (admin: issue / renew / suspend) ------------------
 
 @app.post("/issue")
 def issue_license():
