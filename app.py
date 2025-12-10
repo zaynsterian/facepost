@@ -321,6 +321,37 @@ def public_signup():
 
     return jsonify(resp), 200
 
+@app.route("/check_email", methods=["POST"])
+def check_email():
+    """
+    Endpoint folosit de pagina ContulMeu (frontend) pentru a verifica
+    dacă un email există deja în baza de date (app_users).
+
+    Request JSON:
+      { "email": "user@example.com" }
+
+    Response JSON:
+      { "exists": true }  sau  { "exists": false }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        # răspundem clar dacă nu vine email deloc
+        return jsonify({"exists": False, "error": "email required"}), 400
+
+    res = (
+        supabase.table("app_users")
+        .select("id")
+        .eq("email", email)
+        .maybe_single()
+        .execute()
+    )
+    row = getattr(res, "data", None)
+    exists = bool(row and row.get("id"))
+
+    return jsonify({"exists": exists}), 200
+
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
 @app.post("/issue")
