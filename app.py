@@ -219,25 +219,17 @@ def find_license_for_device(email: str, fingerprint: str):
 def home():
     return f"{APP_NAME} OK", 200
 
-@app.post("/public_signup")
+@app.route("/public_signup", methods=["POST", "OPTIONS"])
 def public_signup():
     """
     Endpoint apelat de formularul de pe site (Bolt).
-    Primește:
-      {
-        "first_name": "...",
-        "last_name": "...",
-        "email": "...",
-        "phone": "...",
-        "accommodation_name": "..."
-      }
-
-    1) Creează / găsește userul în app_users.
-    2) Creează / actualizează profilul în client_profiles.
-    3) Dacă nu există nicio licență activă:
-         - dacă NU are trial deja -> creează trial 14 zile
-         - altfel -> nu creează nimic nou.
+    ...
     """
+    # Preflight CORS – browserul trimite OPTIONS înainte de POST
+    if request.method == "OPTIONS":
+        # răspuns gol, headers CORS sunt adăugați în after_request
+        return ("", 204)
+
     data = request.get_json(force=True, silent=True) or {}
 
     first_name = (data.get("first_name") or "").strip()
