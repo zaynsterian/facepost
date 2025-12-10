@@ -13,6 +13,7 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")  # pentru /issue,/renew,/suspend,/create_trial
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))  # Număr de zile pentru free trial (se poate schimba și din env)
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY lipsesc din env")
@@ -101,10 +102,10 @@ def user_has_trial_license(user_id: str) -> bool:
 
 
 def create_trial_license_for_user(user_id: str):
-    """Creează o licență trial de 14 zile (o singură dată)."""
+    """Creează o licență trial (o singură dată)."""
     license_id = str(uuid4())
     license_key = uuid4().hex
-    trial_expires = _now() + timedelta(days=14)
+    trial_expires = _now() + timedelta(days=TRIAL_DAYS)
 
     payload = {
         "id": license_id,
@@ -113,7 +114,7 @@ def create_trial_license_for_user(user_id: str):
         "active": True,
         "max_devices": 1,  # default 1 device
         "expires_at": trial_expires.isoformat(),
-        "notes": "Free trial 14 days",
+        "notes": f"Free trial {TRIAL_DAYS} days",
         "is_trial": True,
     }
     supabase.table("licenses").insert(payload).execute()
@@ -492,7 +493,7 @@ def suspend():
 
 @app.post("/trial")
 def create_trial():
-    """Admin API: forțează crearea unei licențe trial de 14 zile, dacă nu există."""
+    """Admin API: forțează crearea unei licențe trial, dacă nu există."""
     if not _require_admin_api(request):
         return _json_error("Unauthorized", 401)
 
@@ -528,7 +529,7 @@ def bind_device():
     1) Găsește / creează user pentru email
     2) Caută licență activă pentru email:
        - dacă există → o folosește
-       - dacă nu există → dacă nu a avut trial → creează trial 14 zile
+       - dacă nu există → dacă nu a avut trial → creează trial
                            altfel → eroare „trial deja folosit”
     3) Leagă fingerprint-ul de licență (devices).
     """
@@ -961,7 +962,9 @@ def admin_home():
           <div class="row" style="margin:0">
             <button class="btn-sm" onclick="quickRenew('{{r.email}}', 30)">RENEW +30</button>
             <button class="btn-sm secondary" onclick="quickSuspend('{{r.email}}')">SUSPEND</button>
-            <button class="btn-sm secondary" onclick="quickTrial('{{r.email}}')">ENABLE TRIAL 14</button>
+            <button class="btn-sm secondary" onclick="quickTrial('{{r.email}}')">
+            ENABLE TRIAL {{trial_days}}
+            </button>
             <button class="btn-sm secondary" onclick="viewLogs('{{r.email}}')">LOGS</button>
           </div>
         </td>
@@ -1036,6 +1039,7 @@ async function saveNote(license_id){
         app=APP_NAME,
         rows=rows,
         admin_key=ADMIN_API_KEY or "",
+        trial_days=TRIAL_DAYS,
     )
 
 
