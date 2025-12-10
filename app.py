@@ -22,6 +22,27 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
+# CORS – permitem apeluri din site-ul public (Bolt)
+FRONTEND_ORIGIN = os.environ.get(
+    "FRONTEND_ORIGIN",
+    "https://facepost-romanian-sa-n0gm.bolt.host",  # poți schimba sau lăsa "*"
+)
+
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin")
+
+    # dacă vrei să permiți doar origin-ul tău Bolt:
+    if origin and origin == FRONTEND_ORIGIN:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Vary"] = "Origin"
+    # dacă vrei să fie complet deschis (nu e neapărat nevoie):
+    # resp.headers["Access-Control-Allow-Origin"] = "*"
+
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
+    return resp
+
 # Blueprint pentru updates
 app.register_blueprint(updates_bp)
 
