@@ -102,11 +102,15 @@ def user_has_trial_license(user_id: str) -> bool:
     return bool(getattr(res, "data", None))
 
 
-def create_trial_license_for_user(user_id: str):
+def create_trial_license_for_user(user_id: str, notes_override: str | None = None):
     """Creează o licență trial (o singură dată)."""
     license_id = str(uuid4())
     license_key = uuid4().hex
     trial_expires = _now() + timedelta(days=TRIAL_DAYS)
+
+    notes_val = (notes_override or "").strip()
+    if not notes_val:
+        notes_val = f"Free trial {TRIAL_DAYS} days"
 
     payload = {
         "id": license_id,
@@ -115,7 +119,7 @@ def create_trial_license_for_user(user_id: str):
         "active": True,
         "max_devices": 1,  # default 1 device
         "expires_at": trial_expires.isoformat(),
-        "notes": f"Free trial {TRIAL_DAYS} days",
+        "notes": notes_val,
         "is_trial": True,
     }
     supabase.table("licenses").insert(payload).execute()
@@ -296,9 +300,25 @@ def public_signup():
         # nu avem licență activă; vedem dacă mai poate primi trial
         if not user_has_trial_license(app_user_id):
             lic = create_trial_license_for_user(app_user_id)
+    created_trial = False
+
+    if not lic:
+        # nu avem licență activă; vedem dacă mai poate primi trial
+        if not user_has_trial_license(app_user_id):
+            lic = create_trial_license_for_user(app_user_id)
             created_trial = True
         else:
             lic = None
+
+    # dacă e trial și avem accommodation_name, punem numele unității în notes
+    # (înlocuiește "Free trial 30 days" cu numele completat în formular)
+    try:
+        if lic and lic.get("is_trial") and accommodation_name:
+            supabase.table("licenses").update(
+                {"notes": accommodation_name}
+            ).eq("id", lic["id"]).execute()
+    except Exception as e:
+        print("[PUBLIC_SIGNUP] Nu am putut actualiza notes:", e)
 
     resp = {
         "status": "ok",
