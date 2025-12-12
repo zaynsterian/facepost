@@ -4,7 +4,7 @@ from flask import Blueprint, jsonify
 updates_bp = Blueprint("updates", __name__)
 
 # >>>>>>> EDITAȚI DOAR ACESTE DOUĂ CONSTANTE CÂND FACEȚI UN RELEASE NOU <<<<<<<
-CURRENT_CLIENT_VERSION = "3.1.0"
+CURRENT_CLIENT_VERSION = "3.1.1"
 CLIENT_DOWNLOAD_URL = (
     "https://github.com/zaynsterian/facepost-client/releases/latest/download/Facepost.exe"
 )
