@@ -34,15 +34,30 @@ FRONTEND_ORIGIN = os.environ.get(
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
 
-    # dacă vrei să permiți doar origin-ul tău Bolt:
-    if origin and origin == FRONTEND_ORIGIN:
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Vary"] = "Origin"
-    # dacă vrei să fie complet deschis (nu e neapărat nevoie):
-    # resp.headers["Access-Control-Allow-Origin"] = "*"
+    # Poți pune mai multe origini în env, separate prin virgulă:
+    # FRONTEND_ORIGIN="https://site.ro,https://*.bolt.host"
+    allowed = [o.strip() for o in FRONTEND_ORIGIN.split(",") if o.strip()]
 
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
+    def origin_allowed(o: str) -> bool:
+        if not o:
+            return False
+        for a in allowed:
+            if a == "*":
+                return True
+            if a.startswith("https://*.") and o.startswith(a.replace("*.", "")):
+                return True
+            if o == a:
+                return True
+        return False
+
+    if origin and origin_allowed(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
+        # activează doar dacă chiar folosești cookies/sessions cross-origin:
+        # resp.headers["Access-Control-Allow-Credentials"] = "true"
+
     return resp
 
 # Blueprint pentru updates
@@ -344,23 +359,42 @@ def public_signup():
 
 @app.route("/check_email", methods=["POST", "OPTIONS"])
 def check_email():
+    """
+    Endpoint folosit de pagina ContulMeu (frontend) pentru a verifica
+    dacă un email există deja în baza de date (app_users).
+
+    Request JSON:
+      {"email": "user@example.com"}
+
+    Response JSON:
+      {"exists": true} / {"exists": false}
+    """
+
     # Preflight CORS
     if request.method == "OPTIONS":
         return ("", 204)
 
     data = request.get_json(silent=True) or {}
-    email = str(data.get("email") or "").strip().lower()
+    email = (data.get("email") or "").strip().lower()
 
     if not email:
-        return jsonify({"exists": False, "error": "Email lipsă."}), 400
+        return jsonify({"exists": False, "error": "Missing email"}), 400
 
     try:
-        q = supabase.table("app_users").select("id").eq("email", email).maybe_single().execute()
+        q = (
+            supabase
+            .table("app_users")
+            .select("id")
+            .eq("email", email)
+            .maybe_single()
+            .execute()
+        )
         exists = bool(q.data and q.data.get("id"))
         return jsonify({"exists": exists}), 200
+
     except Exception as e:
-        print("[CHECK_EMAIL] Eroare:", e)
-        return jsonify({"exists": False, "error": "Eroare server."}), 500
+        print("[check_email] Error:", e)
+        return jsonify({"exists": False, "error": "Server error"}), 500
 
 @app.get("/download")
 def download():
