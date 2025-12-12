@@ -342,36 +342,25 @@ def public_signup():
 
     return jsonify(resp), 200
 
-@app.route("/check_email", methods=["POST"])
+@app.route("/check_email", methods=["POST", "OPTIONS"])
 def check_email():
-    """
-    Endpoint folosit de pagina ContulMeu (frontend) pentru a verifica
-    dacă un email există deja în baza de date (app_users).
+    # Preflight CORS
+    if request.method == "OPTIONS":
+        return ("", 204)
 
-    Request JSON:
-      { "email": "user@example.com" }
-
-    Response JSON:
-      { "exists": true }  sau  { "exists": false }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
 
     if not email:
-        # răspundem clar dacă nu vine email deloc
-        return jsonify({"exists": False, "error": "email required"}), 400
+        return jsonify({"exists": False, "error": "Email lipsă."}), 400
 
-    res = (
-        supabase.table("app_users")
-        .select("id")
-        .eq("email", email)
-        .maybe_single()
-        .execute()
-    )
-    row = getattr(res, "data", None)
-    exists = bool(row and row.get("id"))
-
-    return jsonify({"exists": exists}), 200
+    try:
+        q = supabase.table("app_users").select("id").eq("email", email).maybe_single().execute()
+        exists = bool(q.data and q.data.get("id"))
+        return jsonify({"exists": exists}), 200
+    except Exception as e:
+        print("[CHECK_EMAIL] Eroare:", e)
+        return jsonify({"exists": False, "error": "Eroare server."}), 500
 
 @app.get("/download")
 def download():
