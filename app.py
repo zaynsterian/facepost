@@ -14,6 +14,7 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")  # pentru /issue,/renew,/suspend
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))  # Număr de zile pentru free trial (se poate schimba și din env)
+SETUP_DOWNLOAD_URL = "https://github.com/zaynsterian/facepost-client/releases/latest/download/FacepostSetup.exe"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY lipsesc din env")
@@ -352,6 +353,10 @@ def check_email():
 
     return jsonify({"exists": exists}), 200
 
+@app.get("/download")
+def download():
+    return redirect(SETUP_DOWNLOAD_URL, code=302)
+    
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
 @app.post("/issue")
