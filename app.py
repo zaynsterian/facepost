@@ -27,7 +27,8 @@ app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 # CORS – permitem apeluri din site-ul public (Bolt)
 FRONTEND_ORIGIN = os.environ.get(
     "FRONTEND_ORIGIN",
-    "https://facepost.bolt.host",  # poți schimba sau lăsa "*"
+    "https://facepost.bolt.host",
+    "https://facepost.ro", # poți schimba sau lăsa "*"
 )
 
 @app.after_request
