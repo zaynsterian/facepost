@@ -28,7 +28,7 @@ app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 FRONTEND_ORIGIN = os.environ.get(
     "FRONTEND_ORIGIN",
     "https://facepost.bolt.host",
-    "https://facepost.ro", # poți schimba sau lăsa "*"
+    "https://facepost.bolt.host,https://facepost.ro,https://www.facepost.ro", # poți schimba sau lăsa "*"
 )
 
 @app.after_request
