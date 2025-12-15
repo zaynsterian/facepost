@@ -591,6 +591,63 @@ def create_trial():
         }
     ), 200
 
+def _fingerprint_owner_email(fingerprint: str):
+    """
+    Returnează (email, license_id) pentru un fingerprint deja bind-uit, sau (None, None) dacă nu există.
+
+    Anti-abuz: un device (fingerprint) nu poate fi bind-uit la un alt email fără intervenție admin.
+    """
+    fingerprint = (fingerprint or "").strip()
+    if not fingerprint:
+        return None, None
+
+    try:
+        # 1) găsim rapid un device cu fingerprint-ul respectiv
+        res_dev = (
+            supabase.table("devices")
+            .select("license_id")
+            .eq("fingerprint", fingerprint)
+            .limit(1)
+            .execute()
+        )
+        devs = getattr(res_dev, "data", []) or []
+        if not devs:
+            return None, None
+
+        license_id = devs[0].get("license_id")
+        if not license_id:
+            return None, None
+
+        # 2) luăm user-ul licenței
+        res_lic = (
+            supabase.table("licenses")
+            .select("id, app_user_id")
+            .eq("id", license_id)
+            .maybe_single()
+            .execute()
+        )
+        lic = getattr(res_lic, "data", None)
+        if not lic:
+            return None, license_id
+
+        # 3) luăm email-ul user-ului
+        res_user = (
+            supabase.table("app_users")
+            .select("email")
+            .eq("id", lic.get("app_user_id"))
+            .maybe_single()
+            .execute()
+        )
+        u = getattr(res_user, "data", None)
+        bound_email = (u.get("email") if u else None)
+        if bound_email:
+            bound_email = bound_email.strip().lower()
+
+        return bound_email, license_id
+
+    except Exception as e:
+        print("[BIND] fingerprint owner lookup error:", e)
+        return None, None
 
 # ------------------ Client API (/bind, /check) ------------------
 
@@ -610,6 +667,19 @@ def bind_device():
 
     if not email or not fingerprint:
         return _json_error("email and fingerprint required")
+
+    # Anti-abuz: dacă fingerprint-ul este deja bind-uit la ALT email, nu permitem bind nou.
+    bound_email, bound_license_id = _fingerprint_owner_email(fingerprint)
+    if bound_license_id:
+        if bound_email and bound_email != email:
+            return _json_error(
+                "Dispozitivul tău este legat de o altă licență. Dacă dorești ca dispozitivul să fie deconectat de licența actuală te rugăm să contactezi un administrator. Dacă dorești să îți reînnoiești licența intră pe www.facepost.ro",
+                403,
+            )
+
+        # dacă e deja legat la același email, considerăm OK (nu mai facem un bind suplimentar)
+        if bound_email == email:
+            return jsonify({"status": "ok"}), 200
 
     app_user_id = get_or_create_user(email)
     lic = load_best_license_for_email(email)
