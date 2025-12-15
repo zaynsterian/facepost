@@ -382,7 +382,8 @@ def check_email():
 
     try:
         q = supabase.table("app_users").select("id").eq("email", email).maybe_single().execute()
-        exists = bool(q.data and q.data.get("id"))
+        qd = getattr(q, "data", None)
+        exists = bool(qd and qd.get("id"))
         return jsonify({"exists": exists}), 200
     except Exception as e:
         print("[CHECK_EMAIL] Error:", e)
@@ -826,8 +827,8 @@ def check_device():
         .eq("fingerprint", fingerprint)
         .maybe_single()
         .execute()
-        .data
     )
+    dev = getattr(res_dev, "data", None)
     if dev:
         return jsonify(
             {
@@ -867,8 +868,8 @@ def check_device():
         .select("id, fingerprint")
         .eq("license_id", lic["id"])
         .execute()
-        .data
-    ) or []
+    )
+    devs = getattr(res_devs, "data", None) or []
     fingerprints = {d["fingerprint"] for d in devs}
     max_devices = int(lic.get("max_devices") or 1)
 
