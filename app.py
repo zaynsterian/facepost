@@ -236,6 +236,25 @@ def find_license_for_device(email: str, fingerprint: str):
     if not lics:
         return None
 
+    now = _now()
+
+    def _lic_valid(x):
+        if not x.get("active"):
+            return False
+        exp = x.get("expires_at")
+        if exp:
+            try:
+                exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            except Exception:
+                return False
+            if exp_dt < now:
+                return False
+        return True
+
+    lics = [l for l in lics if _lic_valid(l)]
+    if not lics:
+        return None
+
     lic_ids = [l["id"] for l in lics]
 
     res_dev = (
@@ -309,12 +328,6 @@ def public_signup():
 
     # 3) licență
     lic = load_best_license_for_email(email)
-    created_trial = False
-
-    if not lic:
-        # nu avem licență activă; vedem dacă mai poate primi trial
-        if not user_has_trial_license(app_user_id):
-            lic = create_trial_license_for_user(app_user_id)
     created_trial = False
 
     if not lic:
@@ -820,7 +833,7 @@ def check_device():
     )[0]
 
     # 3) dacă device-ul e legat deja la licența aleasă
-    dev = (
+    res_dev = (
         supabase.table("devices")
         .select("id")
         .eq("license_id", lic["id"])
@@ -863,7 +876,7 @@ def check_device():
             ), 200
 
     # 5) device-ul NU este legat nicăieri încă → verificăm locurile disponibile
-    devs = (
+    res_devs = (
         supabase.table("devices")
         .select("id, fingerprint")
         .eq("license_id", lic["id"])
@@ -1195,15 +1208,15 @@ def admin_logs():
 
     app_user_id = get_or_create_user(email)
 
-    rows = (
+    res_logs = (
         supabase.table("run_logs")
         .select("created_at, group_urls, post_text, images_count")
         .eq("app_user_id", app_user_id)
         .order("created_at", desc=True)
         .limit(300)
         .execute()
-        .data
-    ) or []
+    )
+    rows = getattr(res_logs, "data", None) or []
 
     return render_template_string(
         """<!doctype html>
