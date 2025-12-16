@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from flask import Flask, jsonify, request, session, redirect, render_template_string
+import requests
 from supabase import create_client, Client
 from updates_blueprint import updates_bp
 
@@ -15,6 +16,8 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))  # Număr de zile pentru free trial (se poate schimba și din env)
 SETUP_DOWNLOAD_URL = "https://github.com/zaynsterian/facepost-client/releases/latest/download/FacepostSetup.exe"
+GITHUB_REPO = "zaynsterian/facepost-client"
+SETUP_ASSET_NAME = "FacepostSetup.exe"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY lipsesc din env")
@@ -404,7 +407,23 @@ def check_email():
 
 @app.get("/download")
 def download():
-    return redirect(SETUP_DOWNLOAD_URL, code=302)
+    try:
+        # list releases (latest first)
+        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", timeout=10)
+        r.raise_for_status()
+        releases = r.json()
+
+        for rel in releases:
+            assets = rel.get("assets") or []
+            for a in assets:
+                if a.get("name") == SETUP_ASSET_NAME and a.get("browser_download_url"):
+                    return redirect(a["browser_download_url"], code=302)
+
+        return jsonify({"error": f"Asset {SETUP_ASSET_NAME} not found in any release"}), 404
+
+    except Exception as e:
+        print("[DOWNLOAD] Error:", e)
+        return jsonify({"error": "Server error"}), 500
     
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
