@@ -24,6 +24,29 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+# ------------------ CRM DB (Supabase project separat) ------------------
+CRM_SUPABASE_URL = os.environ.get("CRM_SUPABASE_URL")
+CRM_SUPABASE_SERVICE_KEY = os.environ.get("CRM_SUPABASE_SERVICE_KEY")
+
+CRM_ADMIN_USER = os.environ.get("CRM_ADMIN_USER", "admin")
+CRM_ADMIN_PASS = os.environ.get("CRM_ADMIN_PASS", "admin")
+
+CRM_LEADS_TABLE = os.environ.get("CRM_LEADS_TABLE", "leads")
+CRM_PAYMENTS_TABLE = os.environ.get("CRM_PAYMENTS_TABLE", "payments")
+
+CRM_LEAD_EMAIL_COL = os.environ.get("CRM_LEAD_EMAIL_COL", "email")
+CRM_LEAD_CREATED_COL = os.environ.get("CRM_LEAD_CREATED_COL", "created_at")
+
+CRM_PAYMENT_EMAIL_COL = os.environ.get("CRM_PAYMENT_EMAIL_COL", "user_email")
+CRM_PAYMENT_CREATED_COL = os.environ.get("CRM_PAYMENT_CREATED_COL", "created_at")
+CRM_PAYMENT_STATUS_COL = os.environ.get("CRM_PAYMENT_STATUS_COL", "payment_status")
+CRM_PAYMENT_AMOUNT_COL = os.environ.get("CRM_PAYMENT_AMOUNT_COL", "amount")
+CRM_PAYMENT_CURRENCY_COL = os.environ.get("CRM_PAYMENT_CURRENCY_COL", "currency")
+
+crm_supabase: Client | None = None
+if CRM_SUPABASE_URL and CRM_SUPABASE_SERVICE_KEY:
+    crm_supabase = create_client(CRM_SUPABASE_URL, CRM_SUPABASE_SERVICE_KEY)
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
@@ -955,6 +978,262 @@ def log_run():
     supabase.table("run_logs").insert(payload).execute()
     return jsonify({"status": "ok"}), 200
 
+# ------------------ CRM Panel (/crm) ------------------
+def _require_crm_admin():
+    if not session.get("crm_admin_ok"):
+        return redirect("/crm/login")
+
+
+def _crm_required():
+    if crm_supabase is None:
+        raise RuntimeError("CRM_SUPABASE_URL / CRM_SUPABASE_SERVICE_KEY lipsesc din env")
+
+
+def _safe_ilike_or(query, cols, needle):
+    parts = [f"{c}.ilike.%{needle}%" for c in cols]
+    return query.or_(",".join(parts))
+
+
+def _crm_fetch_leads(q: str | None, limit: int = 400):
+    _crm_required()
+    t = (
+        crm_supabase.table(CRM_LEADS_TABLE)
+        .select("id,name,email,phone,company,message,plan_interest,marketing_consent,created_at,ip_address,user_agent")
+        .order(CRM_LEAD_CREATED_COL, desc=True)
+        .limit(limit)
+    )
+
+    if q:
+        needle = q.strip()
+        # DOAR coloane care există la tine:
+        cols = ["email", "phone", "name", "company"]
+        t = _safe_ilike_or(t, cols, needle)
+
+    res = t.execute()
+    return getattr(res, "data", []) or []
+
+
+def _crm_fetch_last_payments_by_email(emails: list[str], limit: int = 3000):
+    _crm_required()
+    emails = [e.strip() for e in (emails or []) if e and e.strip()]
+    if not emails:
+        return {}
+
+    res = (
+        crm_supabase.table(CRM_PAYMENTS_TABLE)
+        .select("id,user_email,stripe_payment_id,stripe_customer_id,amount,currency,plan_type,payment_status,is_installment,installment_number,created_at,completed_at")
+        .in_(CRM_PAYMENT_EMAIL_COL, emails)
+        .order(CRM_PAYMENT_CREATED_COL, desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = getattr(res, "data", []) or []
+
+    out = {}
+    for r in rows:
+        em = (r.get(CRM_PAYMENT_EMAIL_COL) or "").strip().lower()
+        if not em:
+            continue
+        if em in out:
+            continue
+        out[em] = r
+    return out
+
+
+def _crm_category_from_status(payment_status: str | None):
+    st = (payment_status or "").strip().lower()
+
+    paid = {"paid", "succeeded", "success", "completed", "complete"}
+    incomplete = {"open", "pending", "processing", "requires_payment_method", "requires_action", "incomplete"}
+    failed = {"failed", "canceled", "cancelled", "refunded"}
+
+    if st in paid:
+        return "paid"
+    if st in incomplete:
+        return "checkout_incomplete"
+    if st in failed:
+        return "failed"
+    return "no_payment" if not st else f"status:{st}"
+
+
+@app.get("/crm/login")
+def crm_login_page():
+    if session.get("crm_admin_ok"):
+        return redirect("/crm")
+
+    return render_template_string(
+        """
+<!doctype html>
+<title>CRM Login</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#f6f7fb;margin:0}
+ .wrap{max-width:560px;margin:8vh auto;background:#fff;padding:26px 28px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.07)}
+ h1{margin:0 0 18px;font-size:22px}
+ input,button{font-size:16px;padding:12px 14px;border-radius:10px;border:1px solid #d8dbe2;width:100%}
+ button{background:#111827;color:#fff;border:none;cursor:pointer}
+ .row{margin:10px 0}
+ .note{color:#667;font-size:13px;margin-top:12px}
+</style>
+<div class="wrap">
+  <h1>Facepost — CRM Login</h1>
+  <form method="post" action="/crm/login">
+    <div class="row"><input name="user" placeholder="User" autocomplete="username" /></div>
+    <div class="row"><input name="pass" placeholder="Password" type="password" autocomplete="current-password" /></div>
+    <div class="row"><button type="submit">Login</button></div>
+  </form>
+  <div class="note">Panel conectat la DB-ul de Leads/Stripe (proiect Supabase separat).</div>
+</div>
+"""
+    )
+
+
+@app.post("/crm/login")
+def crm_login_action():
+    user = (request.form.get("user") or "").strip()
+    pw = (request.form.get("pass") or "").strip()
+    if user == (CRM_ADMIN_USER or "admin") and pw == (CRM_ADMIN_PASS or "admin"):
+        session["crm_admin_ok"] = True
+        return redirect("/crm")
+    return "Invalid credentials", 403
+
+
+@app.get("/crm/logout")
+def crm_logout():
+    session.pop("crm_admin_ok", None)
+    return redirect("/crm/login")
+
+
+@app.get("/crm")
+def crm_dashboard():
+    redir = _require_crm_admin()
+    if redir:
+        return redir
+
+    q = (request.args.get("q") or "").strip()
+
+    leads = _crm_fetch_leads(q=q or None, limit=400)
+
+    emails = []
+    for l in leads:
+        em = (l.get("email") or "").strip().lower()
+        if em:
+            emails.append(em)
+
+    pay_map = _crm_fetch_last_payments_by_email(emails)
+
+    rows = []
+    for l in leads:
+        em = (l.get("email") or "").strip().lower()
+        p = pay_map.get(em)
+        category = _crm_category_from_status(p.get("payment_status") if p else None)
+
+        rows.append({"lead": l, "pay": p, "category": category})
+
+    return render_template_string(
+        """
+<!doctype html>
+<title>Facepost CRM</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#f6f7fb;margin:0}
+ header{display:flex;justify-content:space-between;align-items:center;padding:18px 26px;background:#fff;border-bottom:1px solid #e7e9f0}
+ h1{font-size:20px;margin:0}
+ .container{max-width:1400px;margin:18px auto;padding:0 18px}
+ .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+ input,button{font-size:13px;padding:10px 12px;border-radius:10px;border:1px solid #d8dbe2}
+ button{background:#111827;color:#fff;border:none;cursor:pointer}
+ a.btn{padding:8px 12px;border-radius:8px;border:1px solid #d8dbe2;background:#edf0f8;color:#333;text-decoration:none}
+ table{width:100%;border-collapse:separate;border-spacing:0 8px}
+ th,td{padding:10px 12px;background:#fff;border-top:1px solid #e9edf5;border-bottom:1px solid #e9edf5;font-size:13px;vertical-align:top}
+ th:first-child,td:first-child{border-left:1px solid #e9edf5;border-top-left-radius:10px;border-bottom-left-radius:10px}
+ th:last-child,td:last-child{border-right:1px solid #e9edf5;border-top-right-radius:10px;border-bottom-right-radius:10px}
+ .muted{color:#778;font-size:12px}
+ .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+ .pill{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;background:#eef2ff;color:#334}
+ .pill.ok{background:#e9fbef;color:#156c2f}
+ .pill.bad{background:#fff0f0;color:#a11}
+ .wraptext{max-width:520px; white-space:normal; word-break:break-word;}
+</style>
+
+<header>
+  <h1>Facepost — CRM (Leads & Payments)</h1>
+  <div><a class="btn" href="/crm/logout">Logout</a></div>
+</header>
+
+<div class="container">
+  <form class="row" method="get" action="/crm">
+    <input name="q" value="{{q}}" placeholder="Caută: email / phone / name / company" style="min-width:420px" />
+    <button type="submit">Search</button>
+    <a class="btn" href="/crm">Reset</a>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Lead</th>
+        <th>Meta</th>
+        <th>Interes</th>
+        <th>Message</th>
+        <th>Ultima plată</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+        {% set l = r.lead %}
+        {% set p = r.pay %}
+        <tr>
+          <td>
+            <div><b>{{ l.get('name') or l.get('company') or '—' }}</b></div>
+            <div class="muted mono">{{ l.get('email') or '—' }}</div>
+            <div class="muted mono">{{ l.get('phone') or '—' }}</div>
+          </td>
+
+          <td>
+            {% if r.category == 'paid' %}
+              <span class="pill ok">paid</span>
+            {% elif r.category == 'failed' %}
+              <span class="pill bad">failed</span>
+            {% else %}
+              <span class="pill">{{ r.category }}</span>
+            {% endif %}
+            <div class="muted" style="margin-top:6px">created: <span class="mono">{{ l.get('created_at') }}</span></div>
+            <div class="muted">marketing: <span class="mono">{{ 'yes' if l.get('marketing_consent') else 'no' }}</span></div>
+          </td>
+
+          <td>
+            <div><span class="mono">{{ l.get('plan_interest') or '—' }}</span></div>
+            <div class="muted">company: <span class="mono">{{ l.get('company') or '—' }}</span></div>
+          </td>
+
+          <td class="wraptext">
+            <div class="mono">{{ l.get('message') or '—' }}</div>
+            <div class="muted" style="margin-top:6px">ip: <span class="mono">{{ l.get('ip_address') or '—' }}</span></div>
+          </td>
+
+          <td>
+            {% if p %}
+              <div>
+                <span class="pill">{{ p.get('payment_status') or 'status?' }}</span>
+                <span class="muted mono">{{ p.get('created_at') or '' }}</span>
+              </div>
+              <div class="muted" style="margin-top:6px">
+                amount: <span class="mono">{{ p.get('amount') or '—' }} {{ (p.get('currency') or '')|upper }}</span>
+              </div>
+              <div class="muted">plan_type: <span class="mono">{{ p.get('plan_type') or '—' }}</span></div>
+              <div class="muted">installment: <span class="mono">{{ 'yes' if p.get('is_installment') else 'no' }}{% if p.get('installment_number') %} #{{p.get('installment_number')}}{% endif %}</span></div>
+              <div class="muted">completed_at: <span class="mono">{{ p.get('completed_at') or '—' }}</span></div>
+            {% else %}
+              <span class="pill">no payment</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+""",
+        q=q,
+        rows=rows,
+    )
 
 # ------------------ Admin Panel ------------------
 
