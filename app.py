@@ -561,6 +561,31 @@ def check_email():
 @app.get("/download")
 def download():
     return redirect(SETUP_DOWNLOAD_URL, code=302)
+
+@app.get("/crm/health")
+def crm_health():
+    redir = _require_crm_admin()
+    if redir:
+        return redir
+
+    out = {
+        "crm_url_set": bool(CRM_SUPABASE_URL),
+        "crm_key_set": bool(CRM_SUPABASE_SERVICE_KEY),
+        "crm_client_ready": crm_supabase is not None,
+    }
+
+    if crm_supabase is None:
+        return jsonify(out), 200
+
+    try:
+        r = crm_supabase.table("leads").select("id,email").limit(1).execute()
+        out["leads_select_ok"] = True
+        out["sample"] = r.data
+    except Exception as e:
+        out["leads_select_ok"] = False
+        out["leads_error"] = str(e)
+
+    return jsonify(out), 200
     
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
