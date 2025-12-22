@@ -549,6 +549,9 @@ def public_signup():
         )
     else:
         resp["license"] = None
+        resp["debug_host"] = request.host
+        resp["debug_origin"] = request.headers.get("Origin")
+        resp["debug_content_type"] = request.headers.get("Content-Type")
 
     return jsonify(resp), 200
 
