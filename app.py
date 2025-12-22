@@ -1432,6 +1432,8 @@ def crm_dashboard():
  th:first-child,td:first-child{border-left:1px solid #e9edf5;border-top-left-radius:10px;border-bottom-left-radius:10px}
  th:last-child,td:last-child{border-right:1px solid #e9edf5;border-top-right-radius:10px;border-bottom-right-radius:10px}
  .muted{color:#778;font-size:12px}
+ .client-name{font-weight:750;font-size:15.5px;line-height:1.15;color:#111827}
+ .client-sub{color:#4b5563;font-size:13.8px;font-weight:650;line-height:1.35;margin-top:2px}
  .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
  .pill{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;background:#eef2ff;color:#334}
  .pill.ok{background:#e9fbef;color:#156c2f}
@@ -1469,10 +1471,10 @@ def crm_dashboard():
         {% set p = r.pay %}
         <tr>
           <td>
-            <div><b>{{ r.display_name }}</b></div>
-            <div class="muted mono">{{ r.display_phone }}</div>
-            <div class="muted mono">{{ l.get('email') or '—' }}</div>
-            <div class="muted">unitate: <span class="mono">{{ r.accommodation }}</span></div>
+            <div class="client-name">{{ r.display_name }}</div>
+            <div class="client-sub mono">{{ r.display_phone }}</div>
+            <div class="client-sub mono">{{ l.get('email') or '—' }}</div>
+            <div class="client-sub">unitate: <span class="mono">{{ r.accommodation }}</span></div>
           </td>
 
           <td>
