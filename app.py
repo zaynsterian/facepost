@@ -481,16 +481,19 @@ def public_signup():
     except Exception as e:
         print("[PUBLIC_SIGNUP] Nu am putut actualiza notes:", e)
 
-     # 4) CRM: scriem lead în proiectul CRM (robust + debug)
+    # 4) CRM: scriem lead în proiectul CRM (robust: select -> update/insert)
     crm_ok = False
     crm_err = None
 
     if crm_supabase is not None:
+        # IP real (primul din X-Forwarded-For)
+        xff = request.headers.get("X-Forwarded-For", "") or ""
+        ip = (xff.split(",")[0].strip() if xff else request.remote_addr)
+
         crm_payload = {
             "name": (f"{first_name} {last_name}".strip() or None),
             "email": email,
             "phone": (phone or None),
-            # fallback; în /crm folosim PRIMARY client_profiles.accommodation_name
             "company": (accommodation_name or None),
             "message": (data.get("message") or "").strip() or None,
             "plan_interest": (data.get("plan_interest") or "").strip() or None,
@@ -499,31 +502,33 @@ def public_signup():
                 if data.get("marketing_consent") is not None
                 else None
             ),
-            "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
+            "ip_address": ip,
             "user_agent": request.headers.get("User-Agent"),
         }
 
         try:
-            # ideal când ai UNIQUE(email) în CRM DB
-            crm_supabase.table("leads").upsert(crm_payload, on_conflict="email").execute()
-            crm_ok = True
-        except Exception as e:
-            crm_err = f"upsert failed: {e}"
-            try:
-                # fallback: insert simplu (merge și fără UNIQUE)
+            # 1) vedem dacă există deja lead-ul după email
+            chk = (
+                crm_supabase.table("leads")
+                .select("id")
+                .eq("email", email)
+                .limit(1)
+                .execute()
+            )
+            exists = bool(getattr(chk, "data", None))
+
+            if exists:
+                # 2) update dacă există
+                crm_supabase.table("leads").update(crm_payload).eq("email", email).execute()
+            else:
+                # 3) insert dacă nu există
                 crm_supabase.table("leads").insert(crm_payload).execute()
-                crm_ok = True
-                crm_err = None
-            except Exception as e2:
-                crm_err = f"insert failed: {e2}"
-                try:
-                    # ultim fallback: update după email (dacă deja există rând)
-                    crm_supabase.table("leads").update(crm_payload).eq("email", email).execute()
-                    # verificăm dacă există după update
-                    chk = crm_supabase.table("leads").select("id").eq("email", email).limit(1).execute()
-                    crm_ok = bool(getattr(chk, "data", None))
-                except Exception as e3:
-                    crm_err = f"update failed: {e3}"
+
+            crm_ok = True
+
+        except Exception as e:
+            crm_err = str(e)
+            print(f"[PUBLIC_SIGNUP][CRM] FAIL email={email} host={request.host} origin={request.headers.get('Origin')} err={crm_err}")
 
     resp = {
         "status": "ok",
@@ -534,6 +539,7 @@ def public_signup():
         "crm_ok": crm_ok,
     }
 
+    resp["crm_ok"] = crm_ok
     if crm_err:
         resp["crm_error"] = crm_err
 
