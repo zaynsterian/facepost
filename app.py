@@ -99,6 +99,50 @@ def _json_error(msg, code=400):
     return jsonify({"error": msg}), code
 
 
+def _pick_any(d: dict, *keys, default=""):
+    """Pick the first non-empty value from d for any of the provided keys."""
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if not k:
+            continue
+        v = d.get(k)
+        if v is None:
+            continue
+        # accept primitives only
+        if isinstance(v, (str, int, float, bool)):
+            s = str(v).strip()
+            if s != "":
+                return v
+    return default
+
+
+def _parse_bool(val, default=False):
+    """Robust bool parser for JSON/form-ish values."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "y", "on", "accepted", "agree", "consent"):
+        return True
+    if s in ("0", "false", "no", "n", "off", "declined", "disagree"):
+        return False
+    return default
+
+
+def _split_full_name(full: str):
+    full = (full or "").strip()
+    if not full:
+        return "", ""
+    parts = [p for p in full.split() if p]
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
 def _require_admin_api(req):
     key = req.headers.get("X-Admin-Key")
     return key and key == (ADMIN_API_KEY or "")
@@ -426,11 +470,24 @@ def public_signup():
 
     data = request.get_json(force=True, silent=True) or {}
 
-    first_name = (data.get("first_name") or "").strip()
-    last_name = (data.get("last_name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    phone = (data.get("phone") or "").strip()
-    accommodation_name = (data.get("accommodation_name") or "").strip()
+    # Acceptăm mai multe denumiri de câmpuri (Bolt / forme vechi / alte implementări)
+    email = (str(_pick_any(data, "email", "user_email", "mail", default=""))).strip().lower()
+    phone = (str(_pick_any(data, "phone", "telefon", "mobile", default=""))).strip()
+
+    # Unele forme trimit un singur câmp "name"
+    name_full = (str(_pick_any(data, "name", "full_name", default=""))).strip()
+
+    first_name = (str(_pick_any(data, "first_name", "firstName", "firstname", default=""))).strip()
+    last_name = (str(_pick_any(data, "last_name", "lastName", "lastname", default=""))).strip()
+    if (not first_name and not last_name) and name_full:
+        first_name, last_name = _split_full_name(name_full)
+
+    accommodation_name = (str(_pick_any(data, "accommodation_name", "accommodationName", "company", "unitate", default=""))).strip()
+
+    # Meta
+    message = (str(_pick_any(data, "message", "msg", default=""))).strip()
+    plan_interest = (str(_pick_any(data, "plan_interest", "planInterest", "plan", default=""))).strip()
+    marketing_consent = _parse_bool(_pick_any(data, "marketing_consent", "marketingConsent", "consent", default=None), default=False)
 
     if not email:
         return _json_error("email required")
@@ -491,42 +548,47 @@ def public_signup():
         ip = (xff.split(",")[0].strip() if xff else request.remote_addr)
 
         crm_payload = {
-            "name": (f"{first_name} {last_name}".strip() or None),
+            # Evităm NULL în coloane care pot fi NOT NULL în schema ta
+            "name": (f"{first_name} {last_name}".strip() or name_full or ""),
             "email": email,
-            "phone": (phone or None),
-            "company": (accommodation_name or None),
-            "message": (data.get("message") or "").strip() or None,
-            "plan_interest": (data.get("plan_interest") or "").strip() or None,
-            "marketing_consent": (
-                bool(data.get("marketing_consent"))
-                if data.get("marketing_consent") is not None
-                else None
-            ),
-            "ip_address": ip,
-            "user_agent": request.headers.get("User-Agent"),
+            "phone": (phone or ""),
+            "company": (accommodation_name or ""),
+            "message": (message or ""),
+            "plan_interest": (plan_interest or ""),
+            "marketing_consent": bool(marketing_consent),
+            "ip_address": (ip or ""),
+            "user_agent": (request.headers.get("User-Agent") or ""),
         }
 
         try:
-            # 1) vedem dacă există deja lead-ul după email
-            chk = (
-                crm_supabase.table("leads")
-                .select("id")
-                .eq("email", email)
-                .limit(1)
-                .execute()
-            )
-            exists = bool(getattr(chk, "data", None))
+            # Încercăm întâi UPSERT (dacă ai UNIQUE pe email). Dacă nu ai, facem fallback.
+            try:
+                crm_supabase.table(CRM_LEADS_TABLE).upsert(
+                    crm_payload, on_conflict=CRM_LEAD_EMAIL_COL
+                ).execute()
+                crm_ok = True
+            except Exception as up_e:
+                # Fallback clasic: select -> update/insert (nu necesită UNIQUE constraint)
+                chk = (
+                    crm_supabase.table(CRM_LEADS_TABLE)
+                    .select("id")
+                    .eq(CRM_LEAD_EMAIL_COL, email)
+                    .limit(1)
+                    .execute()
+                )
+                exists = bool(getattr(chk, "data", None))
 
-            if exists:
-                # 2) update dacă există
-                crm_supabase.table("leads").update(crm_payload).eq("email", email).execute()
-            else:
-                # 3) insert dacă nu există
-                crm_supabase.table("leads").insert(crm_payload).execute()
+                if exists:
+                    crm_supabase.table(CRM_LEADS_TABLE).update(crm_payload).eq(
+                        CRM_LEAD_EMAIL_COL, email
+                    ).execute()
+                else:
+                    crm_supabase.table(CRM_LEADS_TABLE).insert(crm_payload).execute()
 
-            crm_ok = True
+                crm_ok = True
 
         except Exception as e:
+
             crm_err = str(e)
             print(f"[PUBLIC_SIGNUP][CRM] FAIL email={email} host={request.host} origin={request.headers.get('Origin')} err={crm_err}")
 
@@ -614,7 +676,7 @@ def crm_health():
         return jsonify(out), 200
 
     try:
-        r = crm_supabase.table("leads").select("id,email").limit(1).execute()
+        r = crm_supabase.table(CRM_LEADS_TABLE).select("id,email").limit(1).execute()
         out["leads_select_ok"] = True
         out["sample"] = r.data
     except Exception as e:
