@@ -430,23 +430,7 @@ def check_email():
 
 @app.get("/download")
 def download():
-    try:
-        # list releases (latest first)
-        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", timeout=10)
-        r.raise_for_status()
-        releases = r.json()
-
-        for rel in releases:
-            assets = rel.get("assets") or []
-            for a in assets:
-                if a.get("name") == SETUP_ASSET_NAME and a.get("browser_download_url"):
-                    return redirect(a["browser_download_url"], code=302)
-
-        return jsonify({"error": f"Asset {SETUP_ASSET_NAME} not found in any release"}), 404
-
-    except Exception as e:
-        print("[DOWNLOAD] Error:", e)
-        return jsonify({"error": "Server error"}), 500
+    return redirect(SETUP_DOWNLOAD_URL, code=302)
     
 # ------------------ License API (admin: issue / renew / suspend) ------------------
 
