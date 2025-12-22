@@ -15,7 +15,7 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")  # pentru /issue,/renew,/suspend
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))  # Număr de zile pentru free trial (se poate schimba și din env)
-SETUP_DOWNLOAD_URL = "https://github.com/zaynsterian/facepost-client/releases/setup/download/FacepostSetup.exe"
+SETUP_DOWNLOAD_URL = "https://github.com/zaynsterian/facepost-client/releases/download/setup/FacepostSetup.exe"
 GITHUB_REPO = "zaynsterian/facepost-client"
 SETUP_ASSET_NAME = "FacepostSetup.exe"
 
