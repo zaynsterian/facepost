@@ -481,35 +481,61 @@ def public_signup():
     except Exception as e:
         print("[PUBLIC_SIGNUP] Nu am putut actualiza notes:", e)
 
-    # 4) CRM: upsert lead în proiectul CRM (ca să apară imediat în /crm)
+     # 4) CRM: scriem lead în proiectul CRM (robust + debug)
+    crm_ok = False
+    crm_err = None
+
     if crm_supabase is not None:
+        crm_payload = {
+            "name": (f"{first_name} {last_name}".strip() or None),
+            "email": email,
+            "phone": (phone or None),
+            # fallback; în /crm folosim PRIMARY client_profiles.accommodation_name
+            "company": (accommodation_name or None),
+            "message": (data.get("message") or "").strip() or None,
+            "plan_interest": (data.get("plan_interest") or "").strip() or None,
+            "marketing_consent": (
+                bool(data.get("marketing_consent"))
+                if data.get("marketing_consent") is not None
+                else None
+            ),
+            "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
+            "user_agent": request.headers.get("User-Agent"),
+        }
+
         try:
-            crm_payload = {
-                "name": (f"{first_name} {last_name}".strip() or None),
-                "email": email,
-                "phone": (phone or None),
-                # fallback; în /crm folosim PRIMARY client_profiles.accommodation_name
-                "company": (accommodation_name or None),
-                "message": (data.get("message") or "").strip() or None,
-                "plan_interest": (data.get("plan_interest") or "").strip() or None,
-                "marketing_consent": (
-                    bool(data.get("marketing_consent"))
-                    if data.get("marketing_consent") is not None
-                    else None
-                ),
-                "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
-                "user_agent": request.headers.get("User-Agent"),
-            }
+            # ideal când ai UNIQUE(email) în CRM DB
             crm_supabase.table("leads").upsert(crm_payload, on_conflict="email").execute()
+            crm_ok = True
         except Exception as e:
-            print("[PUBLIC_SIGNUP] CRM leads upsert failed:", e)
+            crm_err = f"upsert failed: {e}"
+            try:
+                # fallback: insert simplu (merge și fără UNIQUE)
+                crm_supabase.table("leads").insert(crm_payload).execute()
+                crm_ok = True
+                crm_err = None
+            except Exception as e2:
+                crm_err = f"insert failed: {e2}"
+                try:
+                    # ultim fallback: update după email (dacă deja există rând)
+                    crm_supabase.table("leads").update(crm_payload).eq("email", email).execute()
+                    # verificăm dacă există după update
+                    chk = crm_supabase.table("leads").select("id").eq("email", email).limit(1).execute()
+                    crm_ok = bool(getattr(chk, "data", None))
+                except Exception as e3:
+                    crm_err = f"update failed: {e3}"
 
     resp = {
         "status": "ok",
         "email": email,
         "created_trial": created_trial,
         "profile_saved": not profile_error,
+        # adăugăm doar pentru test/debug (nu strică front-end-ul)
+        "crm_ok": crm_ok,
     }
+
+    if crm_err:
+        resp["crm_error"] = crm_err
 
     if lic:
         resp.update(
@@ -525,6 +551,7 @@ def public_signup():
         resp["license"] = None
 
     return jsonify(resp), 200
+
 
 @app.route("/check_email", methods=["POST", "OPTIONS"])
 def check_email():
