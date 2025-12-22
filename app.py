@@ -300,6 +300,113 @@ def find_license_for_device(email: str, fingerprint: str):
             return l
     return None
 
+def _iso_to_dt(s: str | None):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _best_license_status(licenses: list[dict]):
+    """
+    Returnează (best_license, status_str)
+    status_str: PAID / TRIAL / EXPIRED / SUSPENDED / NO_LICENSE
+    """
+    if not licenses:
+        return None, "NO_LICENSE"
+
+    now = _now()
+
+    def not_expired(lic):
+        exp = _iso_to_dt(lic.get("expires_at"))
+        return (exp is None) or (exp >= now)
+
+    active_valid = [l for l in licenses if l.get("active") and not_expired(l)]
+    if active_valid:
+        paid = [l for l in active_valid if not l.get("is_trial")]
+        pick = paid if paid else active_valid
+        pick.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
+        best = pick[0]
+        return best, ("TRIAL" if best.get("is_trial") else "PAID")
+
+    any_active = [l for l in licenses if l.get("active")]
+    if any_active:
+        any_active.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
+        return any_active[0], "EXPIRED"
+
+    licenses.sort(key=lambda x: (x.get("created_at") or ""), reverse=True)
+    return licenses[0], "SUSPENDED"
+
+
+def _fetch_facepost_hybrid_by_emails(emails: list[str]):
+    """
+    Batch fetch:
+      - app_users: email -> user_id
+      - client_profiles: user_id -> profile (accommodation_name etc.)
+      - licenses: user_id -> best license + status
+      - devices: best_license_id -> unique fingerprints count
+    """
+    emails = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    if not emails:
+        return {}, {}, {}, {}, {}
+
+    # 1) app_users
+    res_u = supabase.table("app_users").select("id,email").in_("email", emails).execute()
+    users = res_u.data or []
+    email_to_uid = {u["email"].lower(): u["id"] for u in users if u.get("email") and u.get("id")}
+    user_ids = list(email_to_uid.values())
+    if not user_ids:
+        return email_to_uid, {}, {}, {}, {}
+
+    # 2) client_profiles
+    res_p = (
+        supabase.table("client_profiles")
+        .select("app_user_id,first_name,last_name,phone,accommodation_name")
+        .in_("app_user_id", user_ids)
+        .execute()
+    )
+    profiles = res_p.data or []
+    uid_to_profile = {p["app_user_id"]: p for p in profiles if p.get("app_user_id")}
+
+    # 3) licenses (luăm toate ca să putem decide PAID/TRIAL/EXPIRED/SUSPENDED)
+    res_l = (
+        supabase.table("licenses")
+        .select("id,app_user_id,active,is_trial,expires_at,max_devices,license_key,created_at,notes")
+        .in_("app_user_id", user_ids)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    lics = res_l.data or []
+    uid_to_all = {}
+    for lic in lics:
+        uid = lic.get("app_user_id")
+        if uid:
+            uid_to_all.setdefault(uid, []).append(lic)
+
+    uid_to_best = {}
+    uid_to_status = {}
+    for uid, lst in uid_to_all.items():
+        best, st = _best_license_status(lst)
+        uid_to_best[uid] = best
+        uid_to_status[uid] = st
+
+    # 4) devices count pentru licențele best
+    best_ids = [b["id"] for b in uid_to_best.values() if b and b.get("id")]
+    lic_to_devcount = {}
+    if best_ids:
+        res_d = supabase.table("devices").select("license_id,fingerprint").in_("license_id", best_ids).execute()
+        devs = res_d.data or []
+        tmp = {}
+        for d in devs:
+            lid = d.get("license_id")
+            fp = d.get("fingerprint")
+            if lid and fp:
+                tmp.setdefault(lid, set()).add(fp)
+        lic_to_devcount = {lid: len(s) for lid, s in tmp.items()}
+
+    return email_to_uid, uid_to_profile, uid_to_best, uid_to_status, lic_to_devcount
 
 # ------------------ Public/health ------------------
 @app.get("/")
@@ -373,6 +480,29 @@ def public_signup():
             ).eq("id", lic["id"]).execute()
     except Exception as e:
         print("[PUBLIC_SIGNUP] Nu am putut actualiza notes:", e)
+
+    # 4) CRM: upsert lead în proiectul CRM (ca să apară imediat în /crm)
+    if crm_supabase is not None:
+        try:
+            crm_payload = {
+                "name": (f"{first_name} {last_name}".strip() or None),
+                "email": email,
+                "phone": (phone or None),
+                # fallback; în /crm folosim PRIMARY client_profiles.accommodation_name
+                "company": (accommodation_name or None),
+                "message": (data.get("message") or "").strip() or None,
+                "plan_interest": (data.get("plan_interest") or "").strip() or None,
+                "marketing_consent": (
+                    bool(data.get("marketing_consent"))
+                    if data.get("marketing_consent") is not None
+                    else None
+                ),
+                "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
+                "user_agent": request.headers.get("User-Agent"),
+            }
+            crm_supabase.table("leads").upsert(crm_payload, on_conflict="email").execute()
+        except Exception as e:
+            print("[PUBLIC_SIGNUP] CRM leads upsert failed:", e)
 
     resp = {
         "status": "ok",
@@ -1103,15 +1233,63 @@ def crm_dashboard():
         if em:
             emails.append(em)
 
+    # ultima plată per email (din CRM DB)
     pay_map = _crm_fetch_last_payments_by_email(emails)
+
+    # hybrid: profile + license + devices (din Facepost DB)
+    email_to_uid, uid_to_profile, uid_to_best, uid_to_status, lic_to_devcount = _fetch_facepost_hybrid_by_emails(emails)
 
     rows = []
     for l in leads:
         em = (l.get("email") or "").strip().lower()
         p = pay_map.get(em)
-        category = _crm_category_from_status(p.get("payment_status") if p else None)
 
-        rows.append({"lead": l, "pay": p, "category": category})
+        uid = email_to_uid.get(em)
+        prof = uid_to_profile.get(uid) if uid else None
+        best = uid_to_best.get(uid) if uid else None
+        lic_status = uid_to_status.get(uid, "NO_LICENSE") if uid else "NO_LICENSE"
+
+        # unitate: PRIMARY din client_profiles.accommodation_name, fallback leads.company
+        accommodation = (prof.get("accommodation_name") if prof else None) or l.get("company") or "—"
+
+        # nume: preferăm first+last din profile; fallback leads.name
+        full_name = None
+        if prof:
+            fn = (prof.get("first_name") or "").strip()
+            ln = (prof.get("last_name") or "").strip()
+            full_name = (f"{fn} {ln}".strip() or None)
+        display_name = full_name or l.get("name") or "—"
+
+        # telefon: profile > lead
+        display_phone = (prof.get("phone") if prof else None) or l.get("phone") or "—"
+
+        # license meta
+        bound = 0
+        max_dev = None
+        exp_at = None
+        lic_key = None
+        if best:
+            lic_id = best.get("id")
+            bound = lic_to_devcount.get(lic_id, 0)
+            max_dev = best.get("max_devices")
+            exp_at = best.get("expires_at")
+            lic_key = best.get("license_key")
+
+        rows.append({
+            "lead": l,
+            "pay": p,
+            "category": _crm_category_from_status(p.get("payment_status") if p else None),
+
+            "display_name": display_name,
+            "display_phone": display_phone,
+            "accommodation": accommodation,
+
+            "license_status": lic_status,
+            "license_key": lic_key,
+            "license_expires_at": exp_at,
+            "license_bound": bound,
+            "license_max": max_dev,
+        })
 
     return render_template_string(
         """
@@ -1121,7 +1299,7 @@ def crm_dashboard():
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#f6f7fb;margin:0}
  header{display:flex;justify-content:space-between;align-items:center;padding:18px 26px;background:#fff;border-bottom:1px solid #e7e9f0}
  h1{font-size:20px;margin:0}
- .container{max-width:1400px;margin:18px auto;padding:0 18px}
+ .container{max-width:1500px;margin:18px auto;padding:0 18px}
  .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
  input,button{font-size:13px;padding:10px 12px;border-radius:10px;border:1px solid #d8dbe2}
  button{background:#111827;color:#fff;border:none;cursor:pointer}
@@ -1139,8 +1317,10 @@ def crm_dashboard():
 </style>
 
 <header>
-  <h1>Facepost — CRM (Leads & Payments)</h1>
-  <div><a class="btn" href="/crm/logout">Logout</a></div>
+  <h1>Facepost — CRM</h1>
+  <div style="display:flex;gap:10px">
+    <a class="btn" href="/crm/logout">Logout</a>
+  </div>
 </header>
 
 <div class="container">
@@ -1153,9 +1333,9 @@ def crm_dashboard():
   <table>
     <thead>
       <tr>
-        <th>Lead</th>
-        <th>Meta</th>
-        <th>Interes</th>
+        <th>Client</th>
+        <th>Licență</th>
+        <th>Lead meta</th>
         <th>Message</th>
         <th>Ultima plată</th>
       </tr>
@@ -1166,31 +1346,38 @@ def crm_dashboard():
         {% set p = r.pay %}
         <tr>
           <td>
-            <div><b>{{ l.get('name') or l.get('company') or '—' }}</b></div>
+            <div><b>{{ r.display_name }}</b></div>
+            <div class="muted mono">{{ r.display_phone }}</div>
             <div class="muted mono">{{ l.get('email') or '—' }}</div>
-            <div class="muted mono">{{ l.get('phone') or '—' }}</div>
+            <div class="muted">unitate: <span class="mono">{{ r.accommodation }}</span></div>
           </td>
 
           <td>
-            {% if r.category == 'paid' %}
-              <span class="pill ok">paid</span>
-            {% elif r.category == 'failed' %}
-              <span class="pill bad">failed</span>
+            {% if r.license_status == 'PAID' %}
+              <span class="pill ok">PAID</span>
+            {% elif r.license_status == 'TRIAL' %}
+              <span class="pill">TRIAL</span>
+            {% elif r.license_status in ['EXPIRED','SUSPENDED'] %}
+              <span class="pill bad">{{ r.license_status }}</span>
             {% else %}
-              <span class="pill">{{ r.category }}</span>
+              <span class="pill">NO LICENSE</span>
             {% endif %}
-            <div class="muted" style="margin-top:6px">created: <span class="mono">{{ l.get('created_at') }}</span></div>
-            <div class="muted">marketing: <span class="mono">{{ 'yes' if l.get('marketing_consent') else 'no' }}</span></div>
+            <div class="muted" style="margin-top:6px">expires: <span class="mono">{{ r.license_expires_at or '—' }}</span></div>
+            <div class="muted">devices: <span class="mono">{{ r.license_bound }} / {{ r.license_max or '—' }}</span></div>
+            {% if r.license_key %}
+              <div class="muted mono" style="margin-top:6px">{{ r.license_key }}</div>
+            {% endif %}
           </td>
 
           <td>
-            <div><span class="mono">{{ l.get('plan_interest') or '—' }}</span></div>
-            <div class="muted">company: <span class="mono">{{ l.get('company') or '—' }}</span></div>
+            <div class="muted">plan_interest: <span class="mono">{{ l.get('plan_interest') or '—' }}</span></div>
+            <div class="muted">marketing: <span class="mono">{{ 'yes' if l.get('marketing_consent') else 'no' }}</span></div>
+            <div class="muted">lead_created: <span class="mono">{{ l.get('created_at') }}</span></div>
+            <div class="muted">ip: <span class="mono">{{ l.get('ip_address') or '—' }}</span></div>
           </td>
 
           <td class="wraptext">
             <div class="mono">{{ l.get('message') or '—' }}</div>
-            <div class="muted" style="margin-top:6px">ip: <span class="mono">{{ l.get('ip_address') or '—' }}</span></div>
           </td>
 
           <td>
@@ -1214,6 +1401,11 @@ def crm_dashboard():
     </tbody>
   </table>
 </div>
+
+<script>
+  // “Real-time” simplu și stabil:
+  setInterval(()=>window.location.reload(), 15000);
+</script>
 """,
         q=q,
         rows=rows,
@@ -1318,7 +1510,10 @@ def _fetch_rows_for_admin():
 
 @app.get("/admin")
 def admin_home():
-    _require_admin()
+    redir = _require_admin()
+    if redir:
+        return redir
+
     rows = _fetch_rows_for_admin()
     return render_template_string(
         """
@@ -1483,7 +1678,10 @@ async function saveNote(license_id){
 @app.get("/admin/logs")
 def admin_logs():
     """Afișează logs de RUN pentru un anumit email."""
-    _require_admin()
+    redir = _require_admin()
+    if redir:
+        return redir
+
     email = (request.args.get("email") or "").strip().lower()
     if not email:
         return _json_error("email required")
@@ -1557,7 +1755,10 @@ def admin_logs():
 
 @app.post("/admin/set_note")
 def admin_set_note():
-    _require_admin()
+    redir = _require_admin()
+    if redir:
+        return redir
+
     data = request.get_json(force=True, silent=True) or {}
     license_id = data.get("license_id")
     note = (data.get("note") or "").strip()
