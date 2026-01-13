@@ -1,7 +1,14 @@
 import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+import time
+import random
+import httpx
 
+try:
+    from supabase.client import ClientOptions
+except Exception:  # compat pentru versiuni mai vechi
+    from supabase.lib.client_options import ClientOptions
 from flask import Flask, jsonify, request, session, redirect, render_template_string
 import requests
 from supabase import create_client, Client
@@ -22,7 +29,15 @@ SETUP_ASSET_NAME = "FacepostSetup.exe"
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY lipsesc din env")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    options=ClientOptions(
+        postgrest_client_timeout=int(os.environ.get("SUPABASE_TIMEOUT", "20")),
+        storage_client_timeout=int(os.environ.get("SUPABASE_TIMEOUT", "20")),
+        schema="public",
+    ),
+)
 
 # ------------------ CRM DB (Supabase project separat) ------------------
 CRM_SUPABASE_URL = os.environ.get("CRM_SUPABASE_URL")
@@ -49,6 +64,30 @@ if CRM_SUPABASE_URL and CRM_SUPABASE_SERVICE_KEY:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+
+def _supabase_call(fn, *, retries: int = 4, base_delay: float = 0.25, max_delay: float = 2.5):
+    """
+    Rulează un apel Supabase cu retry + backoff.
+    Prinde erori intermitente de tip httpx.ReadError/[Errno 11].
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except httpx.HTTPError as e:
+            last_exc = e
+        except OSError as e:
+            # [Errno 11] Resource temporarily unavailable (EAGAIN)
+            last_exc = e
+
+        if attempt >= retries - 1:
+            break
+
+        delay = min(max_delay, base_delay * (2 ** attempt))
+        delay = delay * (1.0 + (random.random() * 0.2))  # jitter mic
+        time.sleep(delay)
+
+    raise last_exc
 
 # CORS – permitem apeluri din site-ul public (Bolt)
 FRONTEND_ORIGIN = os.environ.get(
@@ -278,71 +317,88 @@ def find_license_for_device(email: str, fingerprint: str):
     """
     Caută orice licență activă + neexpirată a userului
     pe care e legat device-ul (în tabela devices).
+
+    IMPORTANT: e folosită în /check; dacă Supabase are hiccup,
+    întoarcem None în loc să crăpăm request-ul.
     """
     email = (email or "").strip().lower()
     if not email or not fingerprint:
         return None
 
-    res_user = (
-        supabase.table("app_users")
-        .select("id")
-        .eq("email", email)
-        .maybe_single()
-        .execute()
-    )
-    user = getattr(res_user, "data", None)
-    if not user:
-        return None
+    try:
+        res_user = _supabase_call(
+            lambda: (
+                supabase.table("app_users")
+                .select("id")
+                .eq("email", email)
+                .maybe_single()
+                .execute()
+            )
+        )
+        user = getattr(res_user, "data", None)
+        if not user:
+            return None
 
-    user_id = user["id"]
+        user_id = user["id"]
 
-    res_lics = (
-        supabase.table("licenses")
-        .select("id, license_key, active, max_devices, expires_at, is_trial")
-        .eq("app_user_id", user_id)
-        .execute()
-    )
-    lics = getattr(res_lics, "data", []) or []
-    if not lics:
-        return None
+        res_lics = _supabase_call(
+            lambda: (
+                supabase.table("licenses")
+                .select("id, license_key, active, max_devices, expires_at, is_trial")
+                .eq("app_user_id", user_id)
+                .execute()
+            )
+        )
+        lics = getattr(res_lics, "data", []) or []
+        if not lics:
+            return None
 
-    now = _now()
+        now = _now()
 
-    def _lic_valid(x):
-        if not x.get("active"):
-            return False
-        exp = x.get("expires_at")
-        if exp:
-            try:
-                exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
-            except Exception:
+        def _lic_valid(x):
+            if not x.get("active"):
                 return False
-            if exp_dt < now:
-                return False
-        return True
+            exp = x.get("expires_at")
+            if exp:
+                try:
+                    exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                except Exception:
+                    return False
+                if exp_dt < now:
+                    return False
+            return True
 
-    lics = [l for l in lics if _lic_valid(l)]
-    if not lics:
+        lics = [l for l in lics if _lic_valid(l)]
+        if not lics:
+            return None
+
+        lic_ids = [l["id"] for l in lics]
+
+        res_dev = _supabase_call(
+            lambda: (
+                supabase.table("devices")
+                .select("license_id, fingerprint")
+                .eq("fingerprint", fingerprint)
+                .in_("license_id", lic_ids)
+                .execute()
+            )
+        )
+        dev = getattr(res_dev, "data", None)
+        if not dev:
+            return None
+        dev = dev[0]
+
+        for l in lics:
+            if l["id"] == dev["license_id"]:
+                return l
         return None
 
-    lic_ids = [l["id"] for l in lics]
-
-    res_dev = (
-        supabase.table("devices")
-        .select("license_id, fingerprint")
-        .eq("fingerprint", fingerprint)
-        .in_("license_id", lic_ids)
-        .execute()
-    )
-    dev = getattr(res_dev, "data", None)
-    if not dev:
+    except (httpx.HTTPError, OSError) as e:
+        try:
+            app.logger.warning("Transient supabase error in find_license_for_device: %s", e)
+        except Exception:
+            pass
         return None
-    dev = dev[0]
-
-    for l in lics:
-        if l["id"] == dev["license_id"]:
-            return l
-    return None
 
 def _iso_to_dt(s: str | None):
     if not s:
@@ -1018,17 +1074,6 @@ def bind_device():
 
 @app.post("/check")
 def check_device():
-    """
-    Verifică licența pentru email + fingerprint.
-
-    Comportament:
-      - dacă există o licență activă & neexpirată pe care e deja legat device-ul → status "ok"
-      - dacă există o altă licență activă & neexpirată a aceluiași user pe care e legat device-ul → status "ok" + note
-      - dacă există licență activă & neexpirată dar device-ul NU este legat și mai e loc → status "unbound"
-      - dacă există doar licențe expirate sau suspendate → status "expired" sau "inactive"
-      - dacă nu există nicio licență pentru email → eroare 404 "license not found"
-      - dacă licența activă e plină ca număr de device-uri → eroare 403 "device limit reached"
-    """
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     fingerprint = (data.get("fingerprint") or "").strip()
@@ -1036,150 +1081,140 @@ def check_device():
     if not email or not fingerprint:
         return _json_error("email and fingerprint required")
 
-    # 1) Găsim userul
-    res_user = (
-        supabase.table("app_users")
-        .select("id")
-        .eq("email", email)
-        .maybe_single()
-        .execute()
-    )
-    user = getattr(res_user, "data", None)
-    if not user:
-        # niciun user => nici licență
-        return _json_error("license not found", 404)
-
-    user_id = user["id"]
-
-    # 2) Luăm toate licențele userului
-    res_lics = (
-        supabase.table("licenses")
-        .select(
-            "id, license_key, active, max_devices, expires_at, app_user_id, notes, is_trial, created_at"
-        )
-        .eq("app_user_id", user_id)
-        .execute()
-    )
-    lics = getattr(res_lics, "data", []) or []
-    if not lics:
-        return _json_error("license not found", 404)
-
-    now = _now()
-
-    def is_valid(lic):
-        if not lic.get("active"):
-            return False
-        exp = lic.get("expires_at")
-        if exp:
-            try:
-                exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
-            except Exception:
-                return False
-            if exp_dt < now:
-                return False
-        return True
-
-    valid_lics = [l for l in lics if is_valid(l)]
-
-    if not valid_lics:
-        # Avem licențe dar niciuna validă acum → fie sunt expirate, fie suspendate
-        # Determinăm un status agregat pentru UI
-        any_active_flag = any(l.get("active") for l in lics)
-        if any_active_flag:
-            agg_status = "expired"
-        else:
-            agg_status = "inactive"
-
-        # Luăm ultima licență (după expires_at / created_at) doar pentru afișare
-        def _sort_key(lic):
-            return (
-                lic.get("expires_at") or "",
-                lic.get("created_at") or "",
+    try:
+        res_user = _supabase_call(
+            lambda: (
+                supabase.table("app_users")
+                .select("id")
+                .eq("email", email)
+                .maybe_single()
+                .execute()
             )
+        )
+        user = getattr(res_user, "data", None)
+        if not user:
+            return _json_error("license not found", 404)
 
-        last_lic = sorted(lics, key=_sort_key)[-1]
-        return jsonify(
-            {
-                "status": agg_status,
-                "expires_at": last_lic.get("expires_at"),
-                "is_trial": last_lic.get("is_trial", False),
-            }
-        ), 200
+        user_id = user["id"]
 
-    # Alegem "cea mai bună" licență validă, preferând non-trial
-    lic = sorted(
-        valid_lics, key=lambda l: (l.get("is_trial", False), l.get("expires_at") or "")
-    )[0]
+        res_lics = _supabase_call(
+            lambda: (
+                supabase.table("licenses")
+                .select("id, license_key, active, max_devices, expires_at, app_user_id, notes, is_trial, created_at")
+                .eq("app_user_id", user_id)
+                .execute()
+            )
+        )
+        lics = getattr(res_lics, "data", []) or []
+        if not lics:
+            return _json_error("license not found", 404)
 
-    # 3) dacă device-ul e legat deja la licența aleasă
-    res_dev = (
-        supabase.table("devices")
-        .select("id")
-        .eq("license_id", lic["id"])
-        .eq("fingerprint", fingerprint)
-        .maybe_single()
-        .execute()
-    )
-    dev = getattr(res_dev, "data", None)
-    if dev:
-        return jsonify(
-            {
-                "status": "ok",
-                "expires_at": lic["expires_at"],
-                "is_trial": lic.get("is_trial", False),
-            }
-        ), 200
+        now = _now()
 
-    # 4) dacă device-ul era legat pe ALTA licență activă a aceluiași user → acceptăm aia
-    alt_lic = find_license_for_device(email, fingerprint)
-    if alt_lic:
-        # find_license_for_device caută deja licențe active + neexpirate,
-        # dar mai facem un sanity-check pe expirare
-        alt_exp_str = alt_lic.get("expires_at")
-        if alt_exp_str:
-            try:
-                alt_exp = datetime.fromisoformat(alt_exp_str.replace("Z", "+00:00"))
-            except Exception:
-                alt_exp = None
-        else:
-            alt_exp = None
+        def is_valid(lic):
+            if not lic.get("active"):
+                return False
+            exp = lic.get("expires_at")
+            if exp:
+                try:
+                    exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                except Exception:
+                    return False
+                if exp_dt < now:
+                    return False
+            return True
 
-        if alt_exp is None or alt_exp >= now:
+        valid_lics = [l for l in lics if is_valid(l)]
+        if not valid_lics:
+            any_active_flag = any(l.get("active") for l in lics)
+            agg_status = "expired" if any_active_flag else "inactive"
+
+            def _sort_key(lic):
+                return (lic.get("expires_at") or "", lic.get("created_at") or "")
+
+            last_lic = sorted(lics, key=_sort_key)[-1]
             return jsonify(
                 {
-                    "status": "ok",
-                    "expires_at": alt_lic.get("expires_at"),
-                    "is_trial": alt_lic.get("is_trial", False),
-                    "note": "device matched older license",
+                    "status": agg_status,
+                    "expires_at": last_lic.get("expires_at"),
+                    "is_trial": last_lic.get("is_trial", False),
                 }
             ), 200
 
-    # 5) device-ul NU este legat nicăieri încă → verificăm locurile disponibile
-    res_devs = (
-        supabase.table("devices")
-        .select("id, fingerprint")
-        .eq("license_id", lic["id"])
-        .execute()
-    )
-    devs = getattr(res_devs, "data", None) or []
-    fingerprints = {d["fingerprint"] for d in devs}
-    max_devices = int(lic.get("max_devices") or 1)
+        lic = sorted(
+            valid_lics,
+            key=lambda l: (l.get("is_trial", False), l.get("expires_at") or ""),
+        )[0]
 
-    if len(fingerprints) >= max_devices and fingerprint not in fingerprints:
-        # licență plină → nu putem lega device-ul
-        return _json_error("device limit reached", 403)
+        res_dev = _supabase_call(
+            lambda: (
+                supabase.table("devices")
+                .select("id")
+                .eq("license_id", lic["id"])
+                .eq("fingerprint", fingerprint)
+                .maybe_single()
+                .execute()
+            )
+        )
+        dev = getattr(res_dev, "data", None)
+        if dev:
+            return jsonify(
+                {
+                    "status": "ok",
+                    "expires_at": lic.get("expires_at"),
+                    "is_trial": lic.get("is_trial", False),
+                }
+            ), 200
 
-    # Există licență validă și mai este loc pentru device,
-    # dar NU facem bind automat aici – doar semnalăm status "unbound"
-    return jsonify(
-        {
-            "status": "unbound",
-            "expires_at": lic["expires_at"],
-            "is_trial": lic.get("is_trial", False),
-            "max_devices": max_devices,
-            "used_devices": len(fingerprints),
-        }
-    ), 200
+        alt_lic = find_license_for_device(email, fingerprint)
+        if alt_lic:
+            alt_exp_str = alt_lic.get("expires_at")
+            if alt_exp_str:
+                try:
+                    alt_exp = datetime.fromisoformat(alt_exp_str.replace("Z", "+00:00"))
+                except Exception:
+                    alt_exp = None
+            else:
+                alt_exp = None
+
+            if alt_exp is None or alt_exp >= now:
+                return jsonify(
+                    {
+                        "status": "ok",
+                        "expires_at": alt_lic.get("expires_at"),
+                        "is_trial": alt_lic.get("is_trial", False),
+                        "note": "device matched older license",
+                    }
+                ), 200
+
+        res_devs = _supabase_call(
+            lambda: (
+                supabase.table("devices")
+                .select("id, fingerprint")
+                .eq("license_id", lic["id"])
+                .execute()
+            )
+        )
+        devs = getattr(res_devs, "data", None) or []
+        fingerprints = {d["fingerprint"] for d in devs}
+        max_devices = int(lic.get("max_devices") or 1)
+
+        if len(fingerprints) >= max_devices and fingerprint not in fingerprints:
+            return _json_error("device limit reached", 403)
+
+        return jsonify(
+            {
+                "status": "unbound",
+                "expires_at": lic.get("expires_at"),
+                "is_trial": lic.get("is_trial", False),
+                "max_devices": max_devices,
+                "used_devices": len(fingerprints),
+            }
+        ), 200
+
+    except (httpx.HTTPError, OSError) as e:
+        app.logger.exception("Supabase/http error on /check: %s", e)
+        return _json_error("temporary upstream error", 503)
 
 
 @app.post("/log_run")
