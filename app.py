@@ -1293,7 +1293,7 @@ def _crm_fetch_last_payments_by_email(emails: list[str], limit: int = 3000):
 
     res = (
         crm_supabase.table(CRM_PAYMENTS_TABLE)
-        .select("id,user_email,stripe_payment_id,stripe_customer_id,amount,currency,plan_type,payment_status,is_installment,installment_number,created_at,completed_at")
+        .select("id,user_email,stripe_payment_id,stripe_customer_id,amount,currency,plan_type,payment_status,created_at,completed_at")
         .in_(CRM_PAYMENT_EMAIL_COL, emails)
         .order(CRM_PAYMENT_CREATED_COL, desc=True)
         .limit(limit)
@@ -1550,7 +1550,9 @@ def crm_dashboard():
                 amount: <span class="mono">{{ p.get('amount') or '—' }} {{ (p.get('currency') or '')|upper }}</span>
               </div>
               <div class="muted">plan_type: <span class="mono">{{ p.get('plan_type') or '—' }}</span></div>
+            {% if 'is_installment' in p or 'installment_number' in p %}
               <div class="muted">installment: <span class="mono">{{ 'yes' if p.get('is_installment') else 'no' }}{% if p.get('installment_number') %} #{{p.get('installment_number')}}{% endif %}</span></div>
+            {% endif %}
               <div class="muted">completed_at: <span class="mono">{{ p.get('completed_at') or '—' }}</span></div>
             {% else %}
               <span class="pill">no payment</span>
