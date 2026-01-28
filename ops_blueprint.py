@@ -43,9 +43,9 @@ def create_ops_blueprint(supabase):
     bp = Blueprint("ops", __name__)
 
     # ------------------ Config (din env) ------------------
-    OPS_USER = os.environ.get("OPS_USER", "")
-    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "")
-    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "12"))
+    OPS_USER = os.environ.get("OPS_USER", "ops")
+    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "$2a$12$R0gUdRna/D3fkk/5.A60B.ZZJplqvG9mSHL.KmB7dmdW7YYdnVFv.")
+    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
     OPS_IP_ALLOWLIST = [
