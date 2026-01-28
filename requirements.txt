@@ -5,3 +5,4 @@ supabase==2.6.0
 itsdangerous>=2.1
 Werkzeug>=3.0
 requests>=2.31
+bcrypt>=4.2.0
