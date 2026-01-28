@@ -43,15 +43,20 @@ def create_ops_blueprint(supabase):
     bp = Blueprint("ops", __name__)
 
     # ------------------ Config (din env) ------------------
-    OPS_USER = os.environ.get("OPS_USER", "ops")
-    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "$2a$12$R0gUdRna/D3fkk/5.A60B.ZZJplqvG9mSHL.KmB7dmdW7YYdnVFv.")
-    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
+    OPS_USER = (os.environ.get("OPS_USER") or "").strip()
+    OPS_PASS_HASH = (os.environ.get("OPS_PASS_HASH") or "").strip()
+    OPS_SESSION_HOURS = int((os.environ.get("OPS_SESSION_HOURS") or "12").strip())
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
+    print("OPS env status:", {
+    "OPS_USER_set": bool(OPS_USER),
+    "OPS_PASS_HASH_set": bool(OPS_PASS_HASH),
+    "OPS_HASH_TYPE": ("bcrypt" if OPS_PASS_HASH.startswith("$2") else "werkzeug/unknown"),
+})
     OPS_IP_ALLOWLIST = [
         x.strip() for x in (os.environ.get("OPS_IP_ALLOWLIST", "") or "").split(",") if x.strip()
     ]
-
+    
     # Login rate limit (in-memory; suficient pentru un panou intern)
     _login_attempts: dict[str, dict[str, Any]] = {}
 
