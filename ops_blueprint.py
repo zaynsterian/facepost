@@ -252,7 +252,12 @@ def create_ops_blueprint(supabase):
         if not OPS_USER or not OPS_PASS_HASH:
             return "OPS credentials not configured in env", 500
 
-        if user != OPS_USER or not check_password_hash(OPS_PASS_HASH, pw):
+        try:
+          ok_pass = check_password_hash(OPS_PASS_HASH, pw)
+        except ValueError:
+          return "OPS_PASS_HASH invalid format. Regenerate using werkzeug.generate_password_hash(...)", 500
+
+        if user != OPS_USER or not ok_pass:
             _rate_limit_bump(ip)
             return redirect("/ops/login?err=Invalid%20credentials")
 
