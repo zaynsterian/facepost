@@ -3,14 +3,16 @@
 Managed Maintenance / Support Console (separat de /admin).
 
 Design goals:
-  - acces doar cu user/parola (hashuit) + sesiune cookie
+  - acces doar cu user/parola + sesiune cookie
   - rate limit login (anti brute-force)
   - CSRF minimal pentru POST-uri
   - UI simplu (render_template_string) ca să nu depindă de templates
 
 Necesită în env:
   OPS_USER
-  OPS_PASS_HASH   (Werkzeug generate_password_hash)
+  OPS_PASS_HASH   (acceptă:
+                    - Werkzeug generate_password_hash -> pbkdf2:sha256:... / scrypt:...
+                    - bcrypt -> $2a$... / $2b$... / $2y$... )
 
 Opțional:
   OPS_SESSION_HOURS (default 12)
@@ -30,6 +32,7 @@ from typing import Any
 from flask import Blueprint, request, session, redirect, render_template_string
 from werkzeug.security import check_password_hash
 
+# bcrypt optional (install via requirements.txt: bcrypt>=4.2.0)
 try:
     import bcrypt  # type: ignore
 except Exception:
@@ -40,32 +43,14 @@ def create_ops_blueprint(supabase):
     bp = Blueprint("ops", __name__)
 
     # ------------------ Config (din env) ------------------
-    OPS_USER = os.environ.get("OPS_USER", "ops")
-    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "$2a$12$R0gUdRna/D3fkk/5.A60B.ZZJplqvG9mSHL.KmB7dmdW7YYdnVFv.")
-    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
+    OPS_USER = os.environ.get("OPS_USER", "")
+    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "")
+    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "12"))
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
     OPS_IP_ALLOWLIST = [
         x.strip() for x in (os.environ.get("OPS_IP_ALLOWLIST", "") or "").split(",") if x.strip()
     ]
-    def _verify_ops_password(stored_hash: str, password: str) -> bool:
-        """
-        Acceptă:
-          - Werkzeug hashes: pbkdf2:sha256:... / scrypt:...
-          - bcrypt hashes: $2a$..., $2b$..., $2y$...
-        """
-        h = (stored_hash or "").strip()
-        if not h:
-            return False
-
-        # bcrypt format
-        if h.startswith("$2a$") or h.startswith("$2b$") or h.startswith("$2y$"):
-            if bcrypt is None:
-                raise RuntimeError("bcrypt not installed (add bcrypt to requirements.txt)")
-            return bcrypt.checkpw(password.encode("utf-8"), h.encode("utf-8"))
-
-        # werkzeug format
-        return check_password_hash(h, password)
 
     # Login rate limit (in-memory; suficient pentru un panou intern)
     _login_attempts: dict[str, dict[str, Any]] = {}
@@ -149,6 +134,28 @@ def create_ops_blueprint(supabase):
         if not form_token:
             return False
         return secrets.compare_digest(str(form_token), str(session.get("ops_csrf") or ""))
+
+    def _verify_ops_password(stored_hash: str, password: str) -> bool:
+        """
+        Acceptă:
+          - bcrypt hashes: $2a$..., $2b$..., $2y$...
+          - werkzeug hashes: pbkdf2:sha256:... / scrypt:...
+
+        Returnează True/False sau aruncă excepție dacă OPS_PASS_HASH e invalid / bcrypt lipsește.
+        """
+        h = (stored_hash or "").strip()
+        if not h:
+            return False
+
+        # bcrypt
+        if h.startswith("$2a$") or h.startswith("$2b$") or h.startswith("$2y$"):
+            if bcrypt is None:
+                raise RuntimeError("bcrypt not installed (add bcrypt>=4.2.0 to requirements.txt)")
+            return bool(bcrypt.checkpw(password.encode("utf-8"), h.encode("utf-8")))
+
+        # werkzeug
+        # check_password_hash poate arunca ValueError dacă formatul e greșit
+        return bool(check_password_hash(h, password))
 
     # ------------------ DB helpers (Supabase) ------------------
     def _sb(table: str):
@@ -271,15 +278,16 @@ def create_ops_blueprint(supabase):
         user = (request.form.get("user") or "").strip()
         pw = (request.form.get("pass") or "").strip()
 
-        # dacă nu ai setat env-urile, refuzăm login (evită 'admin/admin' ca la /admin)
+        # dacă nu ai setat env-urile, refuzăm login
         if not OPS_USER or not OPS_PASS_HASH:
-            return "OPS credentials not configured in env", 500
+            missing = []
+            if not OPS_USER:
+                missing.append("OPS_USER")
+            if not OPS_PASS_HASH:
+                missing.append("OPS_PASS_HASH")
+            return f"OPS credentials not configured in env. Missing: {', '.join(missing)}", 500
 
-        try:
-          ok_pass = check_password_hash(OPS_PASS_HASH, pw)
-        except ValueError:
-          return "OPS_PASS_HASH invalid format. Regenerate using werkzeug.generate_password_hash(...)", 500
-
+        # IMPORTANT: dacă user nu corespunde, nu evaluăm parola (evităm work inutil)
         if user != OPS_USER:
             _rate_limit_bump(ip)
             return redirect("/ops/login?err=Invalid%20credentials")
@@ -287,8 +295,12 @@ def create_ops_blueprint(supabase):
         try:
             ok_pass = _verify_ops_password(OPS_PASS_HASH, pw)
         except Exception:
-            # dacă hash-ul e invalid sau bcrypt lipsește, returnăm un mesaj clar
-            return "OPS_PASS_HASH invalid format or bcrypt missing. Check OPS_PASS_HASH and requirements.", 500
+            # Hash invalid / bcrypt lipsește / altă problemă de verificare
+            return (
+                "OPS_PASS_HASH invalid format or bcrypt missing. "
+                "If using bcrypt ($2a$...), add bcrypt>=4.2.0 to requirements.txt.",
+                500,
+            )
 
         if not ok_pass:
             _rate_limit_bump(ip)
@@ -366,253 +378,4 @@ def create_ops_blueprint(supabase):
 
     {% if q and not row %}
       <div class="warn" style="margin-top:12px;">N-am găsit client pentru <code>{{q}}</code>. Poți crea un record manual:</div>
-      <form class="row" method="post" action="/ops/client/upsert" style="margin-top:10px;">
-        <input type="hidden" name="csrf" value="{{csrf}}" />
-        <input name="support_code" placeholder="Support code (8 chars)" style="min-width:240px" />
-        <input name="email" placeholder="Email (opțional)" style="min-width:280px" />
-        <button type="submit">Create/Upsert</button>
-      </form>
-    {% endif %}
-
-    {% if row %}
-      <div style="margin-top:14px;">
-        <div class="row" style="justify-content:space-between;">
-          <div>
-            <div style="font-size:16px;font-weight:700;">Client: <code>{{row.support_code}}</code></div>
-            <div class="muted">Email: <code>{{row.email or '-'}}</code> · Updated: <code>{{row.updated_at or '-'}}</code></div>
-          </div>
-          <a href="/ops/client/{{row.support_code}}">Open</a>
-        </div>
-      </div>
-    {% endif %}
-  </div>
-
-  <div class="card" style="margin-top:16px;">
-    <div class="row" style="justify-content:space-between;">
-      <div style="font-weight:700;">Recent clients</div>
-      <div class="muted">Ultimele 50 update-uri de stare</div>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Support</th>
-          <th>Email</th>
-          <th>Maintenance</th>
-          <th>Reason</th>
-          <th>Ruleset</th>
-          <th>Bypass</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in recent %}
-        <tr>
-          <td><a href="/ops/client/{{r.support_code}}"><code>{{r.support_code}}</code></a></td>
-          <td class="muted">{{r.email or '-'}}</td>
-          <td>
-            {% if r.maintenance_required %}
-              <span class="pill bad">ON</span>
-            {% else %}
-              <span class="pill ok">OFF</span>
-            {% endif %}
-          </td>
-          <td class="muted">{{r.maintenance_reason or '-'}}</td>
-          <td class="muted">{{r.assigned_ruleset_version or '-'}}</td>
-          <td class="muted">{{r.bypass_until or '-'}}</td>
-          <td class="muted">{{r.updated_at or '-'}}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-""",
-            user=session.get("ops_user") or "",
-            q=q,
-            row=row,
-            recent=recent,
-            csrf=csrf,
-        )
-
-    @bp.post("/client/upsert")
-    def ops_client_upsert():
-        guard = _require_ops()
-        if guard:
-            return guard
-        if not _csrf_check(request.form.get("csrf")):
-            return "CSRF invalid", 400
-
-        support_code = (request.form.get("support_code") or "").strip().upper()
-        email = (request.form.get("email") or "").strip().lower()
-        if len(support_code) != 8:
-            return "support_code must be 8 chars", 400
-
-        payload = {
-            "support_code": support_code,
-            "email": email or None,
-            "maintenance_required": False,
-            "maintenance_reason": "",
-            "assigned_ruleset_version": None,
-            "bypass_until": None,
-            "updated_at": _now_utc_iso(),
-            "updated_by": session.get("ops_user") or "",
-        }
-        row = _upsert_state(payload)
-        if not row:
-            return (
-                "Ops tables missing or Supabase error. Create ops_client_state / ops_audit_log in Supabase.",
-                500,
-            )
-        _audit("upsert_client", target_support_code=support_code, target_email=email)
-        return redirect(f"/ops/client/{support_code}")
-
-    @bp.get("/client/<support_code>")
-    def ops_client_detail(support_code: str):
-        guard = _require_ops()
-        if guard:
-            return guard
-
-        support_code = (support_code or "").strip().upper()
-        row = _get_state_by_support_code(support_code)
-        if not row:
-            # auto-create minimal
-            row = _upsert_state(
-                {
-                    "support_code": support_code,
-                    "email": None,
-                    "maintenance_required": False,
-                    "maintenance_reason": "",
-                    "assigned_ruleset_version": None,
-                    "bypass_until": None,
-                    "updated_at": _now_utc_iso(),
-                    "updated_by": session.get("ops_user") or "",
-                }
-            )
-            if not row:
-                return (
-                    "Ops tables missing or Supabase error. Create ops_client_state / ops_audit_log in Supabase.",
-                    500,
-                )
-
-        csrf = _csrf_get()
-        return render_template_string(
-            """
-<!doctype html>
-<title>Ops — {{row.support_code}}</title>
-<style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;background:#0b1020;margin:0;color:#e9ecf5}
- header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.08)}
- a{color:#9ad0ff;text-decoration:none}
- .wrap{max-width:900px;margin:18px auto;padding:0 18px}
- .card{background:#121a33;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;box-shadow:0 14px 40px rgba(0,0,0,.25)}
- input,select,button{font-size:14px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#0f1630;color:#e9ecf5;box-sizing:border-box}
- button{background:#6d5efc;border:none;cursor:pointer}
- .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
- .muted{color:#aab2d6}
- code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px}
- .pill{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);font-size:12px}
- .ok{background:rgba(60,200,120,.12)}
- .bad{background:rgba(255,90,90,.12)}
-</style>
-<header>
-  <div><a href="/ops">← Back</a></div>
-  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops/logout">Logout</a></div>
-</header>
-
-<div class="wrap">
-  <div class="card">
-    <div style="font-size:18px;font-weight:800;">Client <code>{{row.support_code}}</code></div>
-    <div class="muted" style="margin-top:6px;">Email: <code>{{row.email or '-'}}</code> · Updated: <code>{{row.updated_at or '-'}}</code></div>
-
-    <form method="post" action="/ops/client/{{row.support_code}}/update">
-      <input type="hidden" name="csrf" value="{{csrf}}" />
-
-      <div class="row">
-        <label class="muted" style="min-width:140px;">Email</label>
-        <input name="email" value="{{row.email or ''}}" style="min-width:320px" />
-      </div>
-
-      <div class="row">
-        <label class="muted" style="min-width:140px;">Maintenance</label>
-        <select name="maintenance_required">
-          <option value="0" {% if not row.maintenance_required %}selected{% endif %}>OFF</option>
-          <option value="1" {% if row.maintenance_required %}selected{% endif %}>ON</option>
-        </select>
-        {% if row.maintenance_required %}<span class="pill bad">ON</span>{% else %}<span class="pill ok">OFF</span>{% endif %}
-      </div>
-
-      <div class="row">
-        <label class="muted" style="min-width:140px;">Reason</label>
-        <input name="maintenance_reason" value="{{row.maintenance_reason or ''}}" style="min-width:420px" placeholder="ui_drift / driver_mismatch / security_block ..." />
-      </div>
-
-      <div class="row">
-        <label class="muted" style="min-width:140px;">Assigned ruleset</label>
-        <input name="assigned_ruleset_version" value="{{row.assigned_ruleset_version or ''}}" style="min-width:220px" placeholder="ex: 1.0.3" />
-        <span class="muted">(gol = folosește ruleset default)</span>
-      </div>
-
-      <div class="row">
-        <label class="muted" style="min-width:140px;">Bypass until</label>
-        <input name="bypass_until" value="{{row.bypass_until or ''}}" style="min-width:320px" placeholder="ISO UTC ex: 2026-01-28T12:00:00+00:00" />
-      </div>
-
-      <div class="row" style="justify-content:space-between;">
-        <button type="submit">Save</button>
-        <div class="muted">Tip: Pentru mentenanță asistată, setezi ON + reason; când ai dat fix, setezi OFF.</div>
-      </div>
-    </form>
-  </div>
-</div>
-""",
-            user=session.get("ops_user") or "",
-            row=row,
-            csrf=csrf,
-        )
-
-    @bp.post("/client/<support_code>/update")
-    def ops_client_update(support_code: str):
-        guard = _require_ops()
-        if guard:
-            return guard
-        if not _csrf_check(request.form.get("csrf")):
-            return "CSRF invalid", 400
-
-        support_code = (support_code or "").strip().upper()
-        email = (request.form.get("email") or "").strip().lower()
-        maint = (request.form.get("maintenance_required") or "0").strip() in ("1", "true", "yes", "on")
-        reason = (request.form.get("maintenance_reason") or "").strip()
-        assigned = (request.form.get("assigned_ruleset_version") or "").strip() or None
-        bypass_until = (request.form.get("bypass_until") or "").strip() or None
-
-        payload = {
-            "support_code": support_code,
-            "email": email or None,
-            "maintenance_required": bool(maint),
-            "maintenance_reason": reason,
-            "assigned_ruleset_version": assigned,
-            "bypass_until": bypass_until,
-            "updated_at": _now_utc_iso(),
-            "updated_by": session.get("ops_user") or "",
-        }
-        row = _upsert_state(payload)
-        if not row:
-            return (
-                "Ops tables missing or Supabase error. Create ops_client_state / ops_audit_log in Supabase.",
-                500,
-            )
-
-        _audit(
-            "update_client_state",
-            target_support_code=support_code,
-            target_email=email,
-            details={
-                "maintenance_required": bool(maint),
-                "maintenance_reason": reason,
-                "assigned_ruleset_version": assigned,
-                "bypass_until": bypass_until,
-            },
-        )
-        return redirect(f"/ops/client/{support_code}")
-
-    return bp
+      <form class="row"
