@@ -44,6 +44,7 @@ def create_ops_blueprint(supabase):
 
     # ------------------ Config (din env) ------------------
     OPS_USER = (os.environ.get("OPS_USER") or "").strip()
+    OPS_PASS_PLAINTEXT = (os.environ.get("OPS_PASS_PLAINTEXT") or "").strip()
     OPS_PASS_HASH = (os.environ.get("OPS_PASS_HASH") or "").strip()
     OPS_SESSION_HOURS = int((os.environ.get("OPS_SESSION_HOURS") or "12").strip())
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
@@ -140,15 +141,18 @@ def create_ops_blueprint(supabase):
             return False
         return secrets.compare_digest(str(form_token), str(session.get("ops_csrf") or ""))
 
-    def _verify_ops_password(stored_hash: str, password: str) -> bool:
+    def _verify_ops_password(password: str) -> bool:
         """
-        Acceptă:
-          - bcrypt hashes: $2a$..., $2b$..., $2y$...
-          - werkzeug hashes: pbkdf2:sha256:... / scrypt:...
+        Prioritate:
+          1) OPS_PASS_PLAINTEXT (comparare directă, constant-time)
+          2) OPS_PASS_HASH (bcrypt sau werkzeug)
+        """
+        # 1) Plaintext (temporar)
+        if OPS_PASS_PLAINTEXT:
+            return secrets.compare_digest(password, OPS_PASS_PLAINTEXT)
 
-        Returnează True/False sau aruncă excepție dacă OPS_PASS_HASH e invalid / bcrypt lipsește.
-        """
-        h = (stored_hash or "").strip()
+        # 2) Hash (fallback)
+        h = (OPS_PASS_HASH or "").strip()
         if not h:
             return False
 
@@ -159,7 +163,6 @@ def create_ops_blueprint(supabase):
             return bool(bcrypt.checkpw(password.encode("utf-8"), h.encode("utf-8")))
 
         # werkzeug
-        # check_password_hash poate arunca ValueError dacă formatul e greșit
         return bool(check_password_hash(h, password))
 
     # ------------------ DB helpers (Supabase) ------------------
@@ -293,19 +296,23 @@ def create_ops_blueprint(supabase):
             return f"OPS credentials not configured in env. Missing: {', '.join(missing)}", 500
 
         # IMPORTANT: dacă user nu corespunde, nu evaluăm parola (evităm work inutil)
+                # dacă nu ai setat env-urile, refuzăm login
+        if not OPS_USER or (not OPS_PASS_PLAINTEXT and not OPS_PASS_HASH):
+            missing = []
+            if not OPS_USER:
+                missing.append("OPS_USER")
+            if not OPS_PASS_PLAINTEXT and not OPS_PASS_HASH:
+                missing.append("OPS_PASS_PLAINTEXT or OPS_PASS_HASH")
+            return f"OPS credentials not configured in env. Missing: {', '.join(missing)}", 500
+
         if user != OPS_USER:
             _rate_limit_bump(ip)
             return redirect("/ops/login?err=Invalid%20credentials")
 
         try:
-            ok_pass = _verify_ops_password(OPS_PASS_HASH, pw)
+            ok_pass = _verify_ops_password(pw)
         except Exception:
-            # Hash invalid / bcrypt lipsește / altă problemă de verificare
-            return (
-                "OPS_PASS_HASH invalid format or bcrypt missing. "
-                "If using bcrypt ($2a$...), add bcrypt>=4.2.0 to requirements.txt.",
-                500,
-            )
+            return "Password verification failed (hash invalid or bcrypt missing).", 500
 
         if not ok_pass:
             _rate_limit_bump(ip)
