@@ -30,19 +30,42 @@ from typing import Any
 from flask import Blueprint, request, session, redirect, render_template_string
 from werkzeug.security import check_password_hash
 
+try:
+    import bcrypt  # type: ignore
+except Exception:
+    bcrypt = None
+
 
 def create_ops_blueprint(supabase):
     bp = Blueprint("ops", __name__)
 
     # ------------------ Config (din env) ------------------
     OPS_USER = os.environ.get("OPS_USER", "ops")
-    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "$2a$12$NnzfsH8RbcJ54PTy0kCXxeYp7iZe3m7IW8lD0m6hEuHxSwTu5iLdO")
+    OPS_PASS_HASH = os.environ.get("OPS_PASS_HASH", "$2a$12$R0gUdRna/D3fkk/5.A60B.ZZJplqvG9mSHL.KmB7dmdW7YYdnVFv.")
     OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
     OPS_IP_ALLOWLIST = [
         x.strip() for x in (os.environ.get("OPS_IP_ALLOWLIST", "") or "").split(",") if x.strip()
     ]
+    def _verify_ops_password(stored_hash: str, password: str) -> bool:
+        """
+        Acceptă:
+          - Werkzeug hashes: pbkdf2:sha256:... / scrypt:...
+          - bcrypt hashes: $2a$..., $2b$..., $2y$...
+        """
+        h = (stored_hash or "").strip()
+        if not h:
+            return False
+
+        # bcrypt format
+        if h.startswith("$2a$") or h.startswith("$2b$") or h.startswith("$2y$"):
+            if bcrypt is None:
+                raise RuntimeError("bcrypt not installed (add bcrypt to requirements.txt)")
+            return bcrypt.checkpw(password.encode("utf-8"), h.encode("utf-8"))
+
+        # werkzeug format
+        return check_password_hash(h, password)
 
     # Login rate limit (in-memory; suficient pentru un panou intern)
     _login_attempts: dict[str, dict[str, Any]] = {}
@@ -257,7 +280,17 @@ def create_ops_blueprint(supabase):
         except ValueError:
           return "OPS_PASS_HASH invalid format. Regenerate using werkzeug.generate_password_hash(...)", 500
 
-        if user != OPS_USER or not ok_pass:
+        if user != OPS_USER:
+            _rate_limit_bump(ip)
+            return redirect("/ops/login?err=Invalid%20credentials")
+
+        try:
+            ok_pass = _verify_ops_password(OPS_PASS_HASH, pw)
+        except Exception:
+            # dacă hash-ul e invalid sau bcrypt lipsește, returnăm un mesaj clar
+            return "OPS_PASS_HASH invalid format or bcrypt missing. Check OPS_PASS_HASH and requirements.", 500
+
+        if not ok_pass:
             _rate_limit_bump(ip)
             return redirect("/ops/login?err=Invalid%20credentials")
 
