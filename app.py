@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request, session, redirect, render_template_st
 import requests
 from supabase import create_client, Client
 from updates_blueprint import updates_bp
+from ops_blueprint import create_ops_blueprint
 
 # ------------------ Config ------------------
 APP_NAME = os.environ.get("APP_NAME", "Facepost License Server")
@@ -64,6 +65,12 @@ if CRM_SUPABASE_URL and CRM_SUPABASE_SERVICE_KEY:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+# Cookie hardening (recomandat)
+app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
+app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
+# Pune SESSION_COOKIE_SECURE=1 în env când rulezi pe HTTPS
+if str(os.environ.get("SESSION_COOKIE_SECURE", "")).strip().lower() in ("1", "true", "yes", "on"):
+    app.config["SESSION_COOKIE_SECURE"] = True
 
 def _supabase_call(fn, *, retries: int = 4, base_delay: float = 0.25, max_delay: float = 2.5):
     """
@@ -128,6 +135,8 @@ def add_cors_headers(resp):
 # Blueprint pentru updates
 app.register_blueprint(updates_bp)
 
+# Ops Console (separat de /admin)
+app.register_blueprint(create_ops_blueprint(supabase), url_prefix="/ops")
 
 # ------------------ Helpers ------------------
 def _now():
