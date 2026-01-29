@@ -5,6 +5,7 @@ import time
 import random
 import secrets
 import httpx
+import re
 
 try:
     from supabase.client import ClientOptions
@@ -1532,15 +1533,69 @@ def _crm_fetch_last_payments_by_email(emails: list[str], limit: int = 3000):
     if not emails:
         return {}
 
-    res = (
-        crm_supabase.table(CRM_PAYMENTS_TABLE)
-        .select("id,user_email,stripe_payment_id,stripe_customer_id,amount,currency,plan_type,payment_status,created_at,completed_at")
-        .in_(CRM_PAYMENT_EMAIL_COL, emails)
-        .order(CRM_PAYMENT_CREATED_COL, desc=True)
-        .limit(limit)
-        .execute()
-    )
-    rows = getattr(res, "data", []) or []
+    # IMPORTANT: CRM DB schema poate fi diferit între instanțe.
+    # Dacă adaugi coloane noi (ex: terms_accepted / invoice_type), dar nu sunt încă în DB,
+    # PostgREST aruncă 42703 (column does not exist) și /crm pică.
+    # Ca să fie “safe”, facem select cu coloane opționale și retry fără cele inexistente.
+    desired_cols = [
+        "id",
+        "user_email",
+        "stripe_payment_id",
+        "stripe_customer_id",
+        "stripe_subscription_id",
+        "amount",
+        "currency",
+        "plan_type",
+        "payment_status",
+        "payment_method",
+        "invoice_type",
+        "terms_accepted",
+        "created_at",
+        "completed_at",
+    ]
+
+    def _extract_missing_col(err: Exception) -> str | None:
+        # Supabase PostgREST error tipic:
+        # {'code': '42703', 'message': 'column payments.terms_accepted does not exist', ...}
+        payload = None
+        try:
+            if getattr(err, "args", None):
+                payload = err.args[0]
+        except Exception:
+            payload = None
+
+        msg = ""
+        if isinstance(payload, dict):
+            msg = str(payload.get("message") or "")
+        else:
+            msg = str(err)
+
+        m = re.search(r"column\s+\w+\.(\w+)\s+does not exist", msg, flags=re.IGNORECASE)
+        return m.group(1) if m else None
+
+    cols = desired_cols[:]
+    last_exc = None
+    for _ in range(6):
+        try:
+            res = (
+                crm_supabase.table(CRM_PAYMENTS_TABLE)
+                .select(",".join(cols))
+                .in_(CRM_PAYMENT_EMAIL_COL, emails)
+                .order(CRM_PAYMENT_CREATED_COL, desc=True)
+                .limit(limit)
+                .execute()
+            )
+            rows = getattr(res, "data", []) or []
+            break
+        except Exception as e:
+            last_exc = e
+            missing = _extract_missing_col(e)
+            if missing and missing in cols:
+                cols.remove(missing)
+                continue
+            raise
+    else:
+        raise last_exc
 
     out = {}
     for r in rows:
@@ -1551,6 +1606,48 @@ def _crm_fetch_last_payments_by_email(emails: list[str], limit: int = 3000):
             continue
         out[em] = r
     return out
+
+
+def _crm_checkout_message_from_payment(p: dict | None) -> str | None:
+    """Construiește textul care va fi afișat în coloana Message (CRM).
+
+    Vrem să vedem:
+      - dacă userul a acceptat T&C la checkout
+      - ce tip de factură a ales (PF/Firmă)
+
+    Dacă datele nu există în DB (coloane lipsă sau NULL), întoarce None.
+    """
+    if not p:
+        return None
+
+    terms_val = p.get("terms_accepted")
+    inv_val = p.get("invoice_type")
+
+    # normalize invoice type
+    inv = (str(inv_val).strip().lower() if inv_val is not None else "")
+    if inv in ("persoana_fizica", "pf", "individual", "personal"):
+        inv_label = "PF (CNP)"
+    elif inv in ("firma", "company", "cui", "srL", "srl"):
+        inv_label = "Firmă (CUI)"
+    elif inv:
+        inv_label = inv_val
+    else:
+        inv_label = None
+
+    # normalize terms accepted
+    if terms_val is None:
+        terms_label = None
+    else:
+        try:
+            terms_label = "✅" if bool(terms_val) else "❌"
+        except Exception:
+            terms_label = None
+
+    if not terms_label and not inv_label:
+        return None
+
+    # dacă unul lipsește, îl afișăm ca "—" ca să fie clar că nu avem date complete
+    return f"T&C: {terms_label or '—'} | Factură: {inv_label or '—'}"
 
 
 def _crm_category_from_status(payment_status: str | None):
@@ -1679,6 +1776,8 @@ def crm_dashboard():
             "pay": p,
             "category": _crm_category_from_status(p.get("payment_status") if p else None),
 
+            "checkout_message": _crm_checkout_message_from_payment(p),
+
             "display_name": display_name,
             "display_phone": display_phone,
             "accommodation": accommodation,
@@ -1778,7 +1877,7 @@ def crm_dashboard():
           </td>
 
           <td class="wraptext">
-            <div class="mono">{{ l.get('message') or '—' }}</div>
+            <div class="mono">{{ r.checkout_message or (l.get('message') or '—') }}</div>
           </td>
 
           <td>
