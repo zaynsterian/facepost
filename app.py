@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import time
 import random
-import secrets
 import httpx
 
 try:
@@ -14,7 +13,6 @@ from flask import Flask, jsonify, request, session, redirect, render_template_st
 import requests
 from supabase import create_client, Client
 from updates_blueprint import updates_bp
-from ops_blueprint import create_ops_blueprint
 
 # ------------------ Config ------------------
 APP_NAME = os.environ.get("APP_NAME", "Facepost License Server")
@@ -23,7 +21,7 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")  # pentru /issue,/renew,/suspend,/create_trial
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
-TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))  # Număr de zile pentru free trial (se poate schimba și din env)
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))  # Număr de zile pentru free trial (se poate schimba și din env)
 SETUP_DOWNLOAD_URL = "https://github.com/zaynsterian/facepost-client/releases/download/setup/FacepostSetup.exe"
 GITHUB_REPO = "zaynsterian/facepost-client"
 SETUP_ASSET_NAME = "FacepostSetup.exe"
@@ -66,12 +64,6 @@ if CRM_SUPABASE_URL and CRM_SUPABASE_SERVICE_KEY:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
-# Cookie hardening (recomandat)
-app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
-app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
-# Pune SESSION_COOKIE_SECURE=1 în env când rulezi pe HTTPS
-if str(os.environ.get("SESSION_COOKIE_SECURE", "")).strip().lower() in ("1", "true", "yes", "on"):
-    app.config["SESSION_COOKIE_SECURE"] = True
 
 def _supabase_call(fn, *, retries: int = 4, base_delay: float = 0.25, max_delay: float = 2.5):
     """
@@ -136,116 +128,10 @@ def add_cors_headers(resp):
 # Blueprint pentru updates
 app.register_blueprint(updates_bp)
 
-# Ops Console (separat de /admin)
-app.register_blueprint(create_ops_blueprint(supabase), url_prefix="/ops")
 
 # ------------------ Helpers ------------------
 def _now():
     return datetime.now(timezone.utc)
-
-
-# ------------------ OPS (maintenance / support) helpers ------------------
-OPS_SUPPORT_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # fără O/0, I/1
-
-
-def _parse_iso_utc(s: str | None):
-    if not s:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss.endswith("Z"):
-            ss = ss[:-1] + "+00:00"
-        dt = datetime.fromisoformat(ss)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _ops_bypass_active(bypass_until: str | None) -> bool:
-    dt = _parse_iso_utc(bypass_until)
-    return bool(dt and dt > _now())
-
-
-def _ops_get_state_by_email(email: str):
-    email = (email or "").strip().lower()
-    if not email:
-        return None
-    try:
-        res = _supabase_call(
-            lambda: (
-                supabase.table("ops_client_state")
-                .select("*")
-                .eq("email", email)
-                .limit(1)
-                .execute()
-            )
-        )
-        data = getattr(res, "data", None) or []
-        return data[0] if data else None
-    except Exception:
-        return None
-
-
-def _ops_create_state(email: str):
-    email = (email or "").strip().lower()
-    if not email:
-        return None
-
-    for _ in range(25):
-        code = "".join(secrets.choice(OPS_SUPPORT_ALPHABET) for _ in range(8))
-        payload = {
-            "support_code": code,
-            "email": email,
-            "maintenance_required": False,
-            "maintenance_reason": "",
-            "assigned_ruleset_version": None,
-            "bypass_until": None,
-            "notes": "auto:create",
-            "updated_at": _now().isoformat(),
-            "updated_by": "auto",
-            "created_at": _now().isoformat(),
-        }
-        try:
-            _supabase_call(lambda: supabase.table("ops_client_state").insert(payload).execute())
-            return payload
-        except Exception:
-            existing = _ops_get_state_by_email(email)
-            if existing:
-                return existing
-            continue
-    return None
-
-
-def _ops_get_or_create_state(email: str):
-    row = _ops_get_state_by_email(email)
-    return row or _ops_create_state(email)
-
-
-def _attach_ops_fields(email: str, resp: dict) -> dict:
-    """Atașează câmpuri pentru /ops (support_code + maintenance gate). Best-effort."""
-    try:
-        row = _ops_get_or_create_state(email)
-        if not row:
-            return resp
-
-        bypass_active = _ops_bypass_active(row.get("bypass_until"))
-        maint_effective = bool(row.get("maintenance_required")) and (not bypass_active)
-
-        resp.update(
-            {
-                "support_code": row.get("support_code") or "",
-                "maintenance_required": maint_effective,
-                "maintenance_reason": row.get("maintenance_reason") or "",
-                "maintenance_bypass_until": row.get("bypass_until"),
-                "assigned_ruleset_version": row.get("assigned_ruleset_version") or "",
-            }
-        )
-    except Exception:
-        pass
-    return resp
-
 
 
 def _json_error(msg, code=400):
@@ -1248,11 +1134,11 @@ def check_device():
 
             last_lic = sorted(lics, key=_sort_key)[-1]
             return jsonify(
-                _attach_ops_fields(email, {
+                {
                     "status": agg_status,
                     "expires_at": last_lic.get("expires_at"),
                     "is_trial": last_lic.get("is_trial", False),
-                })
+                }
             ), 200
 
         lic = sorted(
@@ -1273,11 +1159,11 @@ def check_device():
         dev = getattr(res_dev, "data", None)
         if dev:
             return jsonify(
-                _attach_ops_fields(email, {
+                {
                     "status": "ok",
                     "expires_at": lic.get("expires_at"),
                     "is_trial": lic.get("is_trial", False),
-                })
+                }
             ), 200
 
         alt_lic = find_license_for_device(email, fingerprint)
@@ -1293,12 +1179,12 @@ def check_device():
 
             if alt_exp is None or alt_exp >= now:
                 return jsonify(
-                    _attach_ops_fields(email, {
+                    {
                         "status": "ok",
                         "expires_at": alt_lic.get("expires_at"),
                         "is_trial": alt_lic.get("is_trial", False),
                         "note": "device matched older license",
-                    })
+                    }
                 ), 200
 
         res_devs = _supabase_call(
@@ -1317,102 +1203,18 @@ def check_device():
             return _json_error("device limit reached", 403)
 
         return jsonify(
-            _attach_ops_fields(email, {
+            {
                 "status": "unbound",
                 "expires_at": lic.get("expires_at"),
                 "is_trial": lic.get("is_trial", False),
                 "max_devices": max_devices,
                 "used_devices": len(fingerprints),
-            })
+            }
         ), 200
 
     except (httpx.HTTPError, OSError) as e:
         app.logger.exception("Supabase/http error on /check: %s", e)
         return _json_error("temporary upstream error", 503)
-
-
-@app.post("/heartbeat")
-def heartbeat():
-    """Heartbeat/telemetrie minimă (best-effort).
-
-    Clientul trimite periodic:
-      - email, fingerprint
-      - client_version, os
-      - event (startup / idle / run_started / run_finished / run_error etc.)
-      - optional: error_code/error_message, groups_total/groups_posted
-      - optional: clear_error=true pentru a șterge ultima eroare
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    fingerprint = (data.get("fingerprint") or "").strip()
-
-    if not email or not fingerprint:
-        return _json_error("email and fingerprint required")
-
-    # Verificăm că userul există (nu acceptăm heartbeat-uri pentru email-uri inexistente)
-    try:
-        res_user = _supabase_call(
-            lambda: (
-                supabase.table("app_users")
-                .select("id")
-                .eq("email", email)
-                .maybe_single()
-                .execute()
-            )
-        )
-        user = getattr(res_user, "data", None)
-        if not user:
-            return _json_error("license not found", 404)
-    except (httpx.HTTPError, OSError):
-        return _json_error("temporary upstream error", 503)
-
-    row = _ops_get_or_create_state(email)
-    if not row:
-        # best-effort: nu blocăm clientul dacă ops tabelul are o problemă
-        return jsonify({"ok": True}), 200
-
-    now_iso = _now().isoformat()
-    clear_error = _parse_bool(data.get("clear_error"), False)
-
-    def _to_int(v):
-        try:
-            if v is None or v == "":
-                return None
-            return int(v)
-        except Exception:
-            return None
-
-    error_code = (data.get("error_code") or "").strip()[:64] or None
-    error_msg = (data.get("error_message") or "").strip()[:400] or None
-    if clear_error:
-        error_code = None
-        error_msg = None
-
-    payload = {
-        "last_seen_at": now_iso,
-        "last_client_version": (data.get("client_version") or "").strip()[:32] or None,
-        "last_os": (data.get("os") or "").strip()[:120] or None,
-        "last_event": (data.get("event") or "").strip()[:64] or None,
-        "last_event_at": now_iso,
-        "last_error_code": error_code,
-        "last_error_message": error_msg,
-        "last_groups_total": _to_int(data.get("groups_total")),
-        "last_groups_posted": _to_int(data.get("groups_posted")),
-        "updated_at": now_iso,
-        "updated_by": "hb",
-    }
-
-    try:
-        _supabase_call(
-            lambda: supabase.table("ops_client_state").update(payload).eq("email", email).execute()
-        )
-    except Exception:
-        # best-effort: nu blocăm dacă nu putem salva heartbeat
-        pass
-
-    resp = {"ok": True}
-    resp = _attach_ops_fields(email, resp)
-    return jsonify(resp), 200
 
 
 @app.post("/log_run")
@@ -1491,7 +1293,9 @@ def _crm_fetch_last_payments_by_email(emails: list[str], limit: int = 3000):
 
     res = (
         crm_supabase.table(CRM_PAYMENTS_TABLE)
-        .select("id,user_email,stripe_payment_id,stripe_customer_id,amount,currency,plan_type,payment_status,created_at,completed_at")
+        .select(
+            "id,user_email,stripe_payment_id,stripe_customer_id,stripe_subscription_id,amount,currency,plan_type,payment_status,payment_method,invoice_type,terms_accepted,created_at,completed_at"
+        )
         .in_(CRM_PAYMENT_EMAIL_COL, emails)
         .order(CRM_PAYMENT_CREATED_COL, desc=True)
         .limit(limit)
@@ -1631,6 +1435,30 @@ def crm_dashboard():
             exp_at = best.get("expires_at")
             lic_key = best.get("license_key")
 
+        # Checkout meta (din ultima plată): acceptare T&C + tip factură
+        checkout_message = None
+        if p:
+            tval = p.get("terms_accepted")
+            if tval is True:
+                t_part = "T&C: ✅"
+            elif tval is False:
+                t_part = "T&C: ❌"
+            else:
+                t_part = "T&C: —"
+
+            inv_raw = p.get("invoice_type")
+            inv = (inv_raw or "").strip().lower() if inv_raw is not None else ""
+            if inv == "persoana_fizica":
+                inv_part = "Factură: PF (CNP)"
+            elif inv == "firma":
+                inv_part = "Factură: Firmă (CUI)"
+            elif inv:
+                inv_part = f"Factură: {inv_raw}"
+            else:
+                inv_part = "Factură: —"
+
+            checkout_message = f"{t_part} | {inv_part}"
+
         rows.append({
             "lead": l,
             "pay": p,
@@ -1639,6 +1467,8 @@ def crm_dashboard():
             "display_name": display_name,
             "display_phone": display_phone,
             "accommodation": accommodation,
+
+            "checkout_message": checkout_message,
 
             "license_status": lic_status,
             "license_key": lic_key,
@@ -1735,7 +1565,7 @@ def crm_dashboard():
           </td>
 
           <td class="wraptext">
-            <div class="mono">{{ l.get('message') or '—' }}</div>
+            <div class="mono">{{ r.checkout_message or (l.get('message') or '—') }}</div>
           </td>
 
           <td>
