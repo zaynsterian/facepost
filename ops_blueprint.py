@@ -10,6 +10,7 @@ Design goals:
 
 Necesită în env:
   OPS_USER
+  OPS_PASS_PLAINTEXT (parolă în clar — recomandat doar temporar)
   OPS_PASS_HASH   (acceptă:
                     - Werkzeug generate_password_hash -> pbkdf2:sha256:... / scrypt:...
                     - bcrypt -> $2a$... / $2b$... / $2y$... )
@@ -46,18 +47,13 @@ def create_ops_blueprint(supabase):
     OPS_USER = (os.environ.get("OPS_USER") or "").strip()
     OPS_PASS_PLAINTEXT = (os.environ.get("OPS_PASS_PLAINTEXT") or "").strip()
     OPS_PASS_HASH = (os.environ.get("OPS_PASS_HASH") or "").strip()
-    OPS_SESSION_HOURS = int((os.environ.get("OPS_SESSION_HOURS") or "12").strip())
+    OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
-    print("OPS env status:", {
-    "OPS_USER_set": bool(OPS_USER),
-    "OPS_PASS_HASH_set": bool(OPS_PASS_HASH),
-    "OPS_HASH_TYPE": ("bcrypt" if OPS_PASS_HASH.startswith("$2") else "werkzeug/unknown"),
-})
     OPS_IP_ALLOWLIST = [
         x.strip() for x in (os.environ.get("OPS_IP_ALLOWLIST", "") or "").split(",") if x.strip()
     ]
-    
+
     # Login rate limit (in-memory; suficient pentru un panou intern)
     _login_attempts: dict[str, dict[str, Any]] = {}
 
@@ -141,18 +137,15 @@ def create_ops_blueprint(supabase):
             return False
         return secrets.compare_digest(str(form_token), str(session.get("ops_csrf") or ""))
 
-    def _verify_ops_password(password: str) -> bool:
+    def _verify_ops_password(stored_hash: str, password: str) -> bool:
         """
-        Prioritate:
-          1) OPS_PASS_PLAINTEXT (comparare directă, constant-time)
-          2) OPS_PASS_HASH (bcrypt sau werkzeug)
-        """
-        # 1) Plaintext (temporar)
-        if OPS_PASS_PLAINTEXT:
-            return secrets.compare_digest(password, OPS_PASS_PLAINTEXT)
+        Acceptă:
+          - bcrypt hashes: $2a$..., $2b$..., $2y$...
+          - werkzeug hashes: pbkdf2:sha256:... / scrypt:...
 
-        # 2) Hash (fallback)
-        h = (OPS_PASS_HASH or "").strip()
+        Returnează True/False sau aruncă excepție dacă OPS_PASS_HASH e invalid / bcrypt lipsește.
+        """
+        h = (stored_hash or "").strip()
         if not h:
             return False
 
@@ -163,6 +156,7 @@ def create_ops_blueprint(supabase):
             return bool(bcrypt.checkpw(password.encode("utf-8"), h.encode("utf-8")))
 
         # werkzeug
+        # check_password_hash poate arunca ValueError dacă formatul e greșit
         return bool(check_password_hash(h, password))
 
     # ------------------ DB helpers (Supabase) ------------------
@@ -287,32 +281,31 @@ def create_ops_blueprint(supabase):
         pw = (request.form.get("pass") or "").strip()
 
         # dacă nu ai setat env-urile, refuzăm login
-        if not OPS_USER or not OPS_PASS_HASH:
+        if not OPS_USER or not (OPS_PASS_PLAINTEXT or OPS_PASS_HASH):
             missing = []
             if not OPS_USER:
                 missing.append("OPS_USER")
-            if not OPS_PASS_HASH:
-                missing.append("OPS_PASS_HASH")
-            return f"OPS credentials not configured in env. Missing: {', '.join(missing)}", 500
-
-        # IMPORTANT: dacă user nu corespunde, nu evaluăm parola (evităm work inutil)
-                # dacă nu ai setat env-urile, refuzăm login
-        if not OPS_USER or (not OPS_PASS_PLAINTEXT and not OPS_PASS_HASH):
-            missing = []
-            if not OPS_USER:
-                missing.append("OPS_USER")
-            if not OPS_PASS_PLAINTEXT and not OPS_PASS_HASH:
+            if not (OPS_PASS_PLAINTEXT or OPS_PASS_HASH):
                 missing.append("OPS_PASS_PLAINTEXT or OPS_PASS_HASH")
             return f"OPS credentials not configured in env. Missing: {', '.join(missing)}", 500
 
+        # IMPORTANT: dacă user nu corespunde, nu evaluăm parola (evităm work inutil)
         if user != OPS_USER:
             _rate_limit_bump(ip)
             return redirect("/ops/login?err=Invalid%20credentials")
 
         try:
-            ok_pass = _verify_ops_password(pw)
+            if OPS_PASS_PLAINTEXT:
+                ok_pass = secrets.compare_digest(OPS_PASS_PLAINTEXT, pw)
+            else:
+                ok_pass = _verify_ops_password(OPS_PASS_HASH, pw)
         except Exception:
-            return "Password verification failed (hash invalid or bcrypt missing).", 500
+            # Hash invalid / bcrypt lipsește / altă problemă de verificare
+            return (
+                "OPS_PASS_HASH invalid format or bcrypt missing. "
+                "If using bcrypt ($2a$...), add bcrypt>=4.2.0 to requirements.txt.",
+                500,
+            )
 
         if not ok_pass:
             _rate_limit_bump(ip)
@@ -425,6 +418,9 @@ def create_ops_blueprint(supabase):
           <th>Reason</th>
           <th>Ruleset</th>
           <th>Bypass</th>
+          <th>Last seen</th>
+          <th>Version</th>
+          <th>Last error</th>
           <th>Updated</th>
         </tr>
       </thead>
@@ -443,6 +439,14 @@ def create_ops_blueprint(supabase):
           <td class="muted">{{r.maintenance_reason or '-'}}</td>
           <td class="muted">{{r.assigned_ruleset_version or '-'}}</td>
           <td class="muted">{{r.bypass_until or '-'}}</td>
+          <td class="muted">{{r.last_seen_at or '-'}}</td>
+          <td class="muted">{{r.last_client_version or '-'}}</td>
+          <td class="muted">
+            {{r.last_error_code or '-'}}
+            {% if r.last_error_message %}
+              <div style="max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{r.last_error_message}}</div>
+            {% endif %}
+          </td>
           <td class="muted">{{r.updated_at or '-'}}</td>
         </tr>
         {% endfor %}
@@ -546,7 +550,28 @@ def create_ops_blueprint(supabase):
 <div class="wrap">
   <div class="card">
     <div style="font-size:18px;font-weight:800;">Client <code>{{row.support_code}}</code></div>
-    <div class="muted" style="margin-top:6px;">Email: <code>{{row.email or '-'}}</code> · Updated: <code>{{row.updated_at or '-'}}</code></div>
+    <div class="muted" style="margin-top:6px;">
+      Email: <code>{{row.email or '-'}}</code>
+      · Last seen: <code>{{row.last_seen_at or '-'}}</code>
+      · Version: <code>{{row.last_client_version or '-'}}</code>
+      · Updated: <code>{{row.updated_at or '-'}}</code>
+    </div>
+    <div class="muted" style="margin-top:6px;">
+      Last event: <code>{{row.last_event or '-'}}</code> · Event at: <code>{{row.last_event_at or '-'}}</code>
+      · Groups: <code>{{row.last_groups_posted or '-'}}</code>/<code>{{row.last_groups_total or '-'}}</code>
+    </div>
+    {% if row.last_error_code %}
+      <div class="card" style="margin-top:12px;border-left:4px solid #ef4444;">
+        <div style="font-weight:800;">Last error: <code>{{row.last_error_code}}</code></div>
+        {% if row.last_error_message %}
+          <div class="muted" style="margin-top:6px;white-space:pre-wrap;">{{row.last_error_message}}</div>
+        {% endif %}
+        <form method="post" action="/ops/client/{{row.support_code}}/clear_error" style="margin-top:10px;">
+          <input type="hidden" name="csrf" value="{{csrf}}" />
+          <button class="btn" type="submit">Clear last error</button>
+        </form>
+      </div>
+    {% endif %}
 
     <form method="post" action="/ops/client/{{row.support_code}}/update">
       <input type="hidden" name="csrf" value="{{csrf}}" />
@@ -639,4 +664,31 @@ def create_ops_blueprint(supabase):
         )
         return redirect(f"/ops/client/{support_code}")
 
+
+    @bp.post("/client/<support_code>/clear_error")
+    def ops_client_clear_error(support_code: str):
+        guard = _require_ops()
+        if guard:
+            return guard
+        if not _csrf_check(request.form.get("csrf")):
+            return "CSRF invalid", 400
+
+        support_code = (support_code or "").strip().upper()
+        row = _get_state_by_support_code(support_code)
+        if not row:
+            return redirect(f"/ops/client/{support_code}?err=Not%20found")
+
+        payload = {
+            "support_code": support_code,
+            "last_error_code": None,
+            "last_error_message": None,
+            "updated_at": _now_utc_iso(),
+            "updated_by": session.get("ops_user") or "",
+        }
+        _upsert_state(payload)
+        _audit("clear_error", target_support_code=support_code, target_email=row.get("email") or "", details={})
+        return redirect(f"/ops/client/{support_code}?ok=cleared")
+
+
     return bp
+
