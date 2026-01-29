@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import time
 import random
+import secrets
 import httpx
 
 try:
@@ -141,6 +142,99 @@ app.register_blueprint(create_ops_blueprint(supabase), url_prefix="/ops")
 # ------------------ Helpers ------------------
 def _now():
     return datetime.now(timezone.utc)
+
+
+# ------------------ OPS Maintenance Gate Helpers ------------------
+# Aceste helper-e conectează /check cu starea din /ops (ops_client_state).
+# Dacă tabelul ops_client_state nu există încă în Supabase, totul rămâne best-effort
+# (nu va strica flow-ul de licență).
+
+OPS_SUPPORT_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # fără O/0, I/1
+
+def _parse_iso_utc(s: str | None):
+    if not s:
+        return None
+    try:
+        ss = str(s).strip()
+        if not ss:
+            return None
+        if ss.endswith("Z"):
+            ss = ss[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ss)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _ops_bypass_active(bypass_until: str | None) -> bool:
+    dt = _parse_iso_utc(bypass_until)
+    return bool(dt and dt > _now())
+
+def _ops_get_state_by_email(email: str):
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    try:
+        res = _supabase_call(lambda: supabase.table("ops_client_state").select("*").eq("email", email).limit(1).execute())
+        data = getattr(res, "data", None) or []
+        return data[0] if data else None
+    except Exception:
+        return None
+
+def _ops_create_state(email: str):
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+
+    for _ in range(25):
+        code = "".join(secrets.choice(OPS_SUPPORT_ALPHABET) for _ in range(8))
+        payload = {
+            "support_code": code,
+            "email": email,
+            "maintenance_required": False,
+            "maintenance_reason": "",
+            "assigned_ruleset_version": None,
+            "bypass_until": None,
+            "updated_at": _now().isoformat(),
+            "updated_by": "auto:/check",
+        }
+        try:
+            _supabase_call(lambda: supabase.table("ops_client_state").insert(payload).execute())
+            return payload
+        except Exception:
+            existing = _ops_get_state_by_email(email)
+            if existing:
+                return existing
+            continue
+    return None
+
+def _ops_get_or_create_state(email: str):
+    row = _ops_get_state_by_email(email)
+    return row or _ops_create_state(email)
+
+def _attach_ops_fields(email: str, resp: dict) -> dict:
+    """Atașează în răspuns meta câmpuri pentru mentenanță (best-effort)."""
+    try:
+        row = _ops_get_or_create_state(email)
+        if not row:
+            return resp
+
+        bypass_active = _ops_bypass_active(row.get("bypass_until"))
+        maint_effective = bool(row.get("maintenance_required")) and (not bypass_active)
+
+        resp.update({
+            "support_code": row.get("support_code") or "",
+            "maintenance_required": maint_effective,
+            "maintenance_reason": row.get("maintenance_reason") or "",
+            "maintenance_bypass_until": row.get("bypass_until"),
+            "assigned_ruleset_version": row.get("assigned_ruleset_version") or "",
+        })
+    except Exception:
+        # Dacă tabela nu există / Supabase e indisponibil, nu stricăm flow-ul.
+        pass
+    return resp
+
 
 
 def _json_error(msg, code=400):
@@ -1105,6 +1199,16 @@ def check_device():
             return _json_error("license not found", 404)
 
         user_id = user["id"]
+        attach_ops = True
+
+        def _resp(payload: dict, code: int = 200):
+            payload = _attach_ops_fields(email, payload) if attach_ops else payload
+            return jsonify(payload), code
+
+        def _err(msg: str, code: int = 400):
+            payload = {"error": msg}
+            payload = _attach_ops_fields(email, payload) if attach_ops else payload
+            return jsonify(payload), code
 
         res_lics = _supabase_call(
             lambda: (
@@ -1116,7 +1220,7 @@ def check_device():
         )
         lics = getattr(res_lics, "data", []) or []
         if not lics:
-            return _json_error("license not found", 404)
+            return _err("license not found", 404)
 
         now = _now()
 
@@ -1142,13 +1246,11 @@ def check_device():
                 return (lic.get("expires_at") or "", lic.get("created_at") or "")
 
             last_lic = sorted(lics, key=_sort_key)[-1]
-            return jsonify(
-                {
+            return _resp({
                     "status": agg_status,
                     "expires_at": last_lic.get("expires_at"),
                     "is_trial": last_lic.get("is_trial", False),
-                }
-            ), 200
+                }, 200)
 
         lic = sorted(
             valid_lics,
@@ -1167,13 +1269,14 @@ def check_device():
         )
         dev = getattr(res_dev, "data", None)
         if dev:
-            return jsonify(
+            return _resp(
                 {
                     "status": "ok",
                     "expires_at": lic.get("expires_at"),
                     "is_trial": lic.get("is_trial", False),
-                }
-            ), 200
+                },
+                200,
+            )
 
         alt_lic = find_license_for_device(email, fingerprint)
         if alt_lic:
@@ -1187,14 +1290,15 @@ def check_device():
                 alt_exp = None
 
             if alt_exp is None or alt_exp >= now:
-                return jsonify(
+                return _resp(
                     {
                         "status": "ok",
                         "expires_at": alt_lic.get("expires_at"),
                         "is_trial": alt_lic.get("is_trial", False),
                         "note": "device matched older license",
-                    }
-                ), 200
+                    },
+                    200,
+                )
 
         res_devs = _supabase_call(
             lambda: (
@@ -1209,17 +1313,18 @@ def check_device():
         max_devices = int(lic.get("max_devices") or 1)
 
         if len(fingerprints) >= max_devices and fingerprint not in fingerprints:
-            return _json_error("device limit reached", 403)
+            return _err("device limit reached", 403)
 
-        return jsonify(
+        return _resp(
             {
                 "status": "unbound",
                 "expires_at": lic.get("expires_at"),
                 "is_trial": lic.get("is_trial", False),
                 "max_devices": max_devices,
                 "used_devices": len(fingerprints),
-            }
-        ), 200
+            },
+            200,
+        )
 
     except (httpx.HTTPError, OSError) as e:
         app.logger.exception("Supabase/http error on /check: %s", e)
