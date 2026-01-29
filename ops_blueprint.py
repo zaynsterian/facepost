@@ -27,7 +27,8 @@ from __future__ import annotations
 import os
 import time
 import secrets
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from flask import Blueprint, request, session, redirect, render_template_string
@@ -50,6 +51,7 @@ def create_ops_blueprint(supabase):
     OPS_SESSION_HOURS = int(os.environ.get("OPS_SESSION_HOURS", "24"))
     OPS_LOGIN_MAX_ATTEMPTS = int(os.environ.get("OPS_LOGIN_MAX_ATTEMPTS", "8"))
     OPS_LOGIN_WINDOW_SEC = int(os.environ.get("OPS_LOGIN_WINDOW_SEC", "900"))
+    OPS_MIN_CLIENT_VERSION = (os.environ.get("OPS_MIN_CLIENT_VERSION") or "").strip()
     OPS_IP_ALLOWLIST = [
         x.strip() for x in (os.environ.get("OPS_IP_ALLOWLIST", "") or "").split(",") if x.strip()
     ]
@@ -59,6 +61,46 @@ def create_ops_blueprint(supabase):
 
     def _now_utc_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _parse_iso_utc(s: str | None):
+        if not s:
+            return None
+        try:
+            ss = str(s).strip()
+            if ss.endswith("Z"):
+                ss = ss[:-1] + "+00:00"
+            dt = datetime.fromisoformat(ss)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _semver_tuple(v: str | None):
+        try:
+            if not v:
+                return None
+            parts = re.split(r"[^0-9]+", str(v).strip())
+            nums = [int(p) for p in parts if p != ""]
+            if not nums:
+                return None
+            while len(nums) < 3:
+                nums.append(0)
+            return tuple(nums[:3])
+        except Exception:
+            return None
+
+    def _version_outdated(current: str | None, minimum: str | None) -> bool:
+        if not minimum:
+            return False
+        cur = _semver_tuple(current)
+        mn = _semver_tuple(minimum)
+        if mn is None:
+            return False
+        if cur is None:
+            return True
+        return cur < mn
+
 
     def _client_ip() -> str:
         xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
@@ -368,7 +410,7 @@ def create_ops_blueprint(supabase):
 </style>
 <header>
   <div class="brand">Facepost — Ops Console</div>
-  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops/logout">Logout</a></div>
+  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops/attention">Attention</a> · <a href="/ops/logout">Logout</a></div>
 </header>
 
 <div class="wrap">
@@ -421,6 +463,7 @@ def create_ops_blueprint(supabase):
           <th>Last seen</th>
           <th>Version</th>
           <th>Last error</th>
+          <th>Streak</th>
           <th>Updated</th>
         </tr>
       </thead>
@@ -447,6 +490,7 @@ def create_ops_blueprint(supabase):
               <div style="max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{r.last_error_message}}</div>
             {% endif %}
           </td>
+          <td class="muted">{{r.error_streak or 0}}</td>
           <td class="muted">{{r.updated_at or '-'}}</td>
         </tr>
         {% endfor %}
@@ -544,7 +588,7 @@ def create_ops_blueprint(supabase):
 </style>
 <header>
   <div><a href="/ops">← Back</a></div>
-  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops/logout">Logout</a></div>
+  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops/attention">Attention</a> · <a href="/ops/logout">Logout</a></div>
 </header>
 
 <div class="wrap">
@@ -665,6 +709,303 @@ def create_ops_blueprint(supabase):
         return redirect(f"/ops/client/{support_code}")
 
 
+    @bp.get("/attention")
+    def ops_attention():
+        guard = _require_ops()
+        if guard:
+            return guard
+
+        # filters
+        try:
+            off_hours = int((request.args.get("offline_hours") or "24").strip())
+        except Exception:
+            off_hours = 24
+        try:
+            min_streak = int((request.args.get("min_streak") or "3").strip())
+        except Exception:
+            min_streak = 3
+
+        only_errors = _parse_bool(request.args.get("errors"), False)
+        only_offline = _parse_bool(request.args.get("offline"), False)
+        only_outdated = _parse_bool(request.args.get("outdated"), False)
+        only_streak = _parse_bool(request.args.get("streak"), False)
+
+        now_dt = datetime.now(timezone.utc)
+        cutoff = now_dt - timedelta(hours=max(1, min(off_hours, 720)))
+
+        # we fetch a larger window and filter in python (small n, simpler)
+        rows = _list_recent(limit=500)
+
+        items = []
+        for r in rows:
+            last_seen = _parse_iso_utc(r.get("last_seen_at"))
+            is_offline = (last_seen is None) or (last_seen < cutoff)
+
+            has_error = bool(r.get("last_error_code"))
+            try:
+                streak = int(r.get("error_streak") or 0)
+            except Exception:
+                streak = 0
+            is_streak = streak >= max(1, min_streak)
+
+            is_outdated = _version_outdated(r.get("last_client_version"), OPS_MIN_CLIENT_VERSION)
+
+            needs = has_error or is_offline or is_outdated or is_streak
+            if not needs:
+                continue
+
+            if only_errors and not has_error:
+                continue
+            if only_offline and not is_offline:
+                continue
+            if only_outdated and not is_outdated:
+                continue
+            if only_streak and not is_streak:
+                continue
+
+            signals = []
+            if has_error:
+                signals.append("error")
+            if is_streak:
+                signals.append(f"streak:{streak}")
+            if is_offline:
+                signals.append("offline")
+            if is_outdated:
+                signals.append("outdated")
+
+            r["_signals"] = signals
+            items.append(r)
+
+        csrf = _csrf_token()
+        return render_template_string(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>OPS · Attention</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1020;color:#e5e7eb}
+    a{color:#93c5fd;text-decoration:none}
+    code{background:#111827;border:1px solid #1f2937;padding:2px 6px;border-radius:8px}
+    header{padding:18px 22px;border-bottom:1px solid #1f2937;display:flex;align-items:center;justify-content:space-between}
+    .wrap{max-width:1200px;margin:0 auto;padding:18px 22px}
+    .card{background:#0f172a;border:1px solid #1f2937;border-radius:14px;padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .muted{color:#9ca3af}
+    .btn{background:#111827;border:1px solid #374151;border-radius:10px;padding:8px 10px;color:#e5e7eb;cursor:pointer}
+    .btn:hover{border-color:#4b5563}
+    .btn.bad{border-color:#ef4444}
+    .btn.ok{border-color:#22c55e}
+    input,select{background:#0b1020;border:1px solid #374151;border-radius:10px;color:#e5e7eb;padding:8px 10px}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{border-bottom:1px solid #1f2937;padding:10px 8px;text-align:left;vertical-align:top}
+    th{color:#9ca3af;font-weight:700}
+    .pill{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid #374151;font-size:12px}
+    .pill.bad{border-color:#ef4444;color:#fecaca}
+    .pill.warn{border-color:#f59e0b;color:#fde68a}
+    .pill.ok{border-color:#22c55e;color:#bbf7d0}
+    .sig{display:flex;gap:6px;flex-wrap:wrap}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}
+    .tiny{font-size:12px}
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <div style="font-weight:900;letter-spacing:.3px;">OPS · Attention</div>
+    <div class="muted tiny">Only items that need attention (errors / offline / outdated / streak).</div>
+  </div>
+  <div class="muted">Logged in as <code>{{user}}</code> · <a href="/ops">Dashboard</a> · <a href="/ops/logout">Logout</a></div>
+</header>
+
+<div class="wrap">
+
+  <div class="card">
+    <form method="get" action="/ops/attention" class="row">
+      <label class="muted">Offline > hours</label>
+      <input name="offline_hours" value="{{off_hours}}" style="width:90px" />
+      <label class="muted">Min streak</label>
+      <input name="min_streak" value="{{min_streak}}" style="width:90px" />
+      <label class="muted">Min version</label>
+      <input value="{{min_version or '-'}}" disabled style="width:140px" />
+      <label class="muted"><input type="checkbox" name="errors" value="1" {% if only_errors %}checked{% endif %}/> errors</label>
+      <label class="muted"><input type="checkbox" name="offline" value="1" {% if only_offline %}checked{% endif %}/> offline</label>
+      <label class="muted"><input type="checkbox" name="outdated" value="1" {% if only_outdated %}checked{% endif %}/> outdated</label>
+      <label class="muted"><input type="checkbox" name="streak" value="1" {% if only_streak %}checked{% endif %}/> streak</label>
+      <button class="btn" type="submit">Filter</button>
+    </form>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div style="font-weight:800;">Items: {{items|length}}</div>
+        <div class="muted tiny">Tip: set OPS_MIN_CLIENT_VERSION in env to enable outdated detection.</div>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Support</th>
+          <th>Email</th>
+          <th>Signals</th>
+          <th>Last seen</th>
+          <th>Version</th>
+          <th>Last error</th>
+          <th>Streak</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in items %}
+        <tr>
+          <td><a href="/ops/client/{{r.support_code}}"><code>{{r.support_code}}</code></a></td>
+          <td class="muted">{{r.email or '-'}}</td>
+          <td>
+            <div class="sig">
+              {% for s in r._signals %}
+                {% if s == "error" %}
+                  <span class="pill bad">error</span>
+                {% elif s == "offline" %}
+                  <span class="pill warn">offline</span>
+                {% elif s == "outdated" %}
+                  <span class="pill warn">outdated</span>
+                {% elif s.startswith("streak") %}
+                  <span class="pill bad">{{s}}</span>
+                {% else %}
+                  <span class="pill">{{s}}</span>
+                {% endif %}
+              {% endfor %}
+            </div>
+          </td>
+          <td class="muted">{{r.last_seen_at or '-'}}</td>
+          <td class="muted">{{r.last_client_version or '-'}}</td>
+          <td class="muted">
+            {{r.last_error_code or '-'}}
+            {% if r.last_error_message %}
+              <div style="max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{r.last_error_message}}</div>
+            {% endif %}
+          </td>
+          <td class="muted">{{r.error_streak or 0}}</td>
+          <td>
+            <div class="actions">
+              <a class="btn" href="/ops/client/{{r.support_code}}">Open</a>
+
+              <form method="post" action="/ops/client/{{r.support_code}}/maintenance_on">
+                <input type="hidden" name="csrf" value="{{csrf}}" />
+                <input type="hidden" name="next" value="/ops/attention?{{qs}}" />
+                <input type="hidden" name="reason" value="{% if r.last_error_code %}auto:{{r.last_error_code}}{% else %}attention{% endif %}" />
+                <button class="btn bad" type="submit">Maintenance ON</button>
+              </form>
+
+              <form method="post" action="/ops/client/{{r.support_code}}/bypass">
+                <input type="hidden" name="csrf" value="{{csrf}}" />
+                <input type="hidden" name="next" value="/ops/attention?{{qs}}" />
+                <input type="hidden" name="hours" value="2" />
+                <button class="btn ok" type="submit">Bypass 2h</button>
+              </form>
+
+              {% if r.last_error_code %}
+              <form method="post" action="/ops/client/{{r.support_code}}/clear_error">
+                <input type="hidden" name="csrf" value="{{csrf}}" />
+                <input type="hidden" name="next" value="/ops/attention?{{qs}}" />
+                <button class="btn" type="submit">Clear error</button>
+              </form>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</div>
+</body>
+</html>
+""",
+            user=session.get("ops_user") or "",
+            items=items,
+            off_hours=off_hours,
+            min_streak=min_streak,
+            min_version=OPS_MIN_CLIENT_VERSION,
+            only_errors=only_errors,
+            only_offline=only_offline,
+            only_outdated=only_outdated,
+            only_streak=only_streak,
+            csrf=csrf,
+            qs=request.query_string.decode("utf-8"),
+        )
+
+    @bp.post("/client/<support_code>/maintenance_on")
+    def ops_client_maintenance_on(support_code: str):
+        guard = _require_ops()
+        if guard:
+            return guard
+        if not _csrf_check(request.form.get("csrf")):
+            return "CSRF invalid", 400
+
+        support_code = (support_code or "").strip().upper()
+        row = _get_state_by_support_code(support_code)
+        if not row:
+            return redirect(f"/ops/client/{support_code}?err=Not%20found")
+
+        reason = (request.form.get("reason") or "").strip()[:120] or "attention"
+
+        payload = {
+            "support_code": support_code,
+            "maintenance_required": True,
+            "maintenance_reason": reason,
+            "updated_at": _now_utc_iso(),
+            "updated_by": session.get("ops_user") or "",
+        }
+        _upsert_state(payload)
+        _audit("maintenance_on", target_support_code=support_code, target_email=row.get("email") or "", details={"reason": reason})
+
+        nxt = (request.form.get("next") or "").strip()
+        if nxt:
+            return redirect(nxt)
+        return redirect(f"/ops/client/{support_code}?ok=maintenance_on")
+
+    @bp.post("/client/<support_code>/bypass")
+    def ops_client_bypass(support_code: str):
+        guard = _require_ops()
+        if guard:
+            return guard
+        if not _csrf_check(request.form.get("csrf")):
+            return "CSRF invalid", 400
+
+        support_code = (support_code or "").strip().upper()
+        row = _get_state_by_support_code(support_code)
+        if not row:
+            return redirect(f"/ops/client/{support_code}?err=Not%20found")
+
+        try:
+            hours = int((request.form.get("hours") or "2").strip())
+        except Exception:
+            hours = 2
+        hours = max(1, min(hours, 72))
+
+        until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+        payload = {
+            "support_code": support_code,
+            "bypass_until": until,
+            "updated_at": _now_utc_iso(),
+            "updated_by": session.get("ops_user") or "",
+        }
+        _upsert_state(payload)
+        _audit("bypass", target_support_code=support_code, target_email=row.get("email") or "", details={"hours": hours})
+
+        nxt = (request.form.get("next") or "").strip()
+        if nxt:
+            return redirect(nxt)
+        return redirect(f"/ops/client/{support_code}?ok=bypass")
+
+
     @bp.post("/client/<support_code>/clear_error")
     def ops_client_clear_error(support_code: str):
         guard = _require_ops()
@@ -682,11 +1023,16 @@ def create_ops_blueprint(supabase):
             "support_code": support_code,
             "last_error_code": None,
             "last_error_message": None,
+            "last_error_at": None,
+            "error_streak": 0,
             "updated_at": _now_utc_iso(),
             "updated_by": session.get("ops_user") or "",
         }
         _upsert_state(payload)
         _audit("clear_error", target_support_code=support_code, target_email=row.get("email") or "", details={})
+        nxt = (request.form.get("next") or "").strip()
+        if nxt:
+            return redirect(nxt)
         return redirect(f"/ops/client/{support_code}?ok=cleared")
 
 
